@@ -48,6 +48,32 @@ static float frand(void)
     return ((float)((rng_state >> 8) & 0xFFFF) / 32768.0f) - 1.0f;
 }
 
+/* Discover the quantised types the checkpoint actually stores, asking the
+ * file instead of a hand-written list that could drift. Returns every stored
+ * 2-d type whose rows are 32-element aligned; the caller filters for kernel
+ * support. 0 on success, -1 when the table overflows. */
+static int collect_stored_types(const gguf_file_t *g, uint32_t *types,
+                                int max_types, int *n_types)
+{
+    uint64_t ti;
+    int      n = 0, i;
+
+    for (ti = 0; ti < g->tensor_count; ++ti) {
+        const gguf_tensor_t *t = &g->tensors[ti];
+        int                  seen = 0;
+
+        if (t->n_dims < 2) continue;
+        if (t->dims[0] % 32 != 0) continue;
+        if (nita_row_bytes(t->type, t->dims[0]) == 0) continue;
+        for (i = 0; i < n; ++i) if (types[i] == t->type) seen = 1;
+        if (seen) continue;
+        if (n == max_types) return -1;
+        types[n++] = t->type;
+    }
+    *n_types = n;
+    return 0;
+}
+
 /* One row: returns the relative error of the integer dot. */
 static double one_row(uint32_t type, const uint8_t *src, uint32_t k, int nb,
                       float *row, float *x, nita_aq8_t *aq, double *abs_err)
@@ -245,6 +271,102 @@ static int run_type(const gguf_file_t *g, uint32_t type, int max_rows,
     return 0;
 }
 
+/* Tile arbiter: the fused prefill kernels (nita_quant_dot_tile) must agree
+ * with the sequential integer dot they accelerate, on the same int8-quantised
+ * activations. A layout mistake in a fused kernel shows up as an error near
+ * 100% - which is exactly what the Q4_K tile did while decode stayed
+ * correct. The remaining difference should be float32 scale-application
+ * ordering, i.e. ~1e-6; anything at 1e-3 is a bug. */
+#define TILE_T 8
+static int run_tile_type(const gguf_file_t *g, uint32_t type, int max_rows,
+                         int *n_checked, int *n_failed, double *worst_out)
+{
+    uint64_t ti;
+
+    *n_checked = 0;
+    *n_failed  = 0;
+    *worst_out = 0.0;
+
+    for (ti = 0; ti < g->tensor_count; ++ti) {
+        const gguf_tensor_t *t = &g->tensors[ti];
+        size_t               k, nrows, row_bytes, r, maxr;
+        float               *x, *tile_out;
+        nita_aq8_t          *aq;
+        int                  nb;
+
+        if (t->type != type || t->n_dims < 2) continue;
+        k         = (size_t)t->dims[0];
+        nrows     = (size_t)t->dims[1];
+        row_bytes = nita_row_bytes(t->type, t->dims[0]);
+        if (k % 32 != 0 || row_bytes == 0) continue;
+
+        nb       = (int)(k / 32);
+        x        = (float *)malloc((size_t)TILE_T * k * sizeof *x);
+        tile_out = (float *)malloc((size_t)TILE_T * sizeof *tile_out);
+        aq       = (nita_aq8_t *)malloc((size_t)TILE_T * (size_t)nb * sizeof *aq);
+        if (!x || !tile_out || !aq) { free(x); free(tile_out); free(aq); return 2; }
+
+        {
+            int a, j;
+
+            for (a = 0; a < TILE_T; ++a) {
+                for (j = 0; j < (int)k; ++j) x[(size_t)a * k + (size_t)j] = frand();
+                nita_aq8_quantise(x + (size_t)a * k, (int)k, aq + (size_t)a * (size_t)nb);
+            }
+        }
+
+        maxr = (size_t)(max_rows < (int)nrows ? max_rows : (int)nrows);
+        for (r = 0; r < maxr; ++r) {
+            const uint8_t *src = g->data + g->data_offset + t->offset + r * row_bytes;
+            int             a;
+
+            memset(tile_out, 0, (size_t)TILE_T * sizeof *tile_out);
+            nita_quant_dot_tile(type, src, aq, nb, TILE_T, nb, tile_out, 1);
+            for (a = 0; a < TILE_T; ++a) {
+                float  want = nita_quant_dot(type, src, aq + (size_t)a * (size_t)nb, nb);
+                double rel  = fabs((double)tile_out[a] - (double)want) /
+                              ((double)fabs((double)want) + 1.0);
+
+                if (rel > *worst_out) *worst_out = rel;
+                ++*n_checked;
+                if (rel > 1e-3) ++*n_failed;
+            }
+        }
+        free(x); free(tile_out); free(aq);
+    }
+    return 0;
+}
+
+static int run_tile(const gguf_file_t *g, int max_rows)
+{
+    uint32_t types[64];
+    int      n_types = 0, total = 0, failed = 0, i;
+
+    if (collect_stored_types(g, types, (int)(sizeof types / sizeof types[0]),
+                             &n_types) != 0) {
+        fprintf(stderr, "more than %d tensor types; raise the array\n", n_types);
+        return 2;
+    }
+    for (i = 0; i < n_types; ++i) {
+        int    n_checked = 0, n_failed = 0;
+        double worst = 0.0;
+
+        if (!nita_quant_has_int_dot(types[i])) {
+            printf("type %-3u %-7s  no integer kernel, skipped\n",
+                   types[i], ggml_type_name(types[i]));
+            continue;
+        }
+        if (run_tile_type(g, types[i], max_rows, &n_checked, &n_failed, &worst) != 0)
+            return 2;
+        printf("type %-3u %-7s  %5d dot(s), %d over the 1e-3 tolerance, worst rel err %.3e\n",
+               types[i], ggml_type_name(types[i]), n_checked, n_failed, worst);
+        total  += n_checked;
+        failed += n_failed;
+    }
+    printf("%d type(s), %d dot(s), %d over tolerance\n", n_types, total, failed);
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     gguf_file_t *g;
@@ -257,6 +379,17 @@ int main(int argc, char **argv)
     if (argc >= 3 && strcmp(argv[1], "--bench") == 0)
         return run_bench(argv[2], argc > 3 ? atoi(argv[3]) : 2000);
 
+    if (argc >= 3 && strcmp(argv[1], "--tile") == 0) {
+        int t_max = 32, trc;
+
+        if (argc > 3) t_max = atoi(argv[3]);
+        g = gguf_load(argv[2], err, sizeof err);
+        if (!g) { fprintf(stderr, "load failed: %s\n", err); return 2; }
+        trc = run_tile(g, t_max);
+        gguf_free(g);
+        return trc;
+    }
+
     if (argc >= 3 && strcmp(argv[1], "--all") == 0) {
         /* Discover the types the checkpoint actually stores. Naming one by hand
          * tests nothing at all if the checkpoint uses a different type, and a
@@ -267,24 +400,15 @@ int main(int argc, char **argv)
         int      i;
 
         if (argc > 3) max_rows = atoi(argv[3]);
+        (void)ti;
         g = gguf_load(argv[2], err, sizeof err);
         if (!g) { fprintf(stderr, "load failed: %s\n", err); return 2; }
 
-        for (ti = 0; ti < g->tensor_count; ++ti) {
-            const gguf_tensor_t *t = &g->tensors[ti];
-            int                  seen = 0;
-
-            if (t->n_dims < 2) continue;
-            if (t->dims[0] % 32 != 0) continue;
-            if (nita_row_bytes(t->type, t->dims[0]) == 0) continue;
-            for (i = 0; i < n_types; ++i) if (types[i] == t->type) seen = 1;
-            if (seen) continue;
-            if (n_types == (int)(sizeof types / sizeof types[0])) {
-                fprintf(stderr, "more than %d tensor types; raise the array\n", n_types);
-                gguf_free(g);
-                return 2;
-            }
-            types[n_types++] = t->type;
+        if (collect_stored_types(g, types, (int)(sizeof types / sizeof types[0]),
+                                 &n_types) != 0) {
+            fprintf(stderr, "more than %d tensor types; raise the array\n", n_types);
+            gguf_free(g);
+            return 2;
         }
 
         for (i = 0; i < n_types; ++i) {
@@ -316,8 +440,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <file.gguf> <type-id> [rows]\n"
                         "       %s --all <file.gguf> [rows]   every type in the file\n"
                         "       %s --raw <blob>\n"
-                        "       %s --bench <blob> [iters]\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                        "       %s --bench <blob> [iters]\n"
+                        "       %s --tile <file.gguf> [rows]  fused tile kernels vs sequential dot\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
