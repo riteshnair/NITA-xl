@@ -2388,20 +2388,29 @@ static void dot_tile_q4_K(const uint8_t *row, const nita_aq8_t *a, int stride,
             int            j;
 
             q4k_scales(blk + 4, sc, mn);
-            for (j = 0; j < 8; ++j) {
-                const __m128i b128 = _mm_loadu_si128((const __m128i *)(qs + j * 16));
-                const __m128i m0f  = _mm_set1_epi8(0x0F);
-                const __m256i w8   = _mm256_set_m128i(
-                                         _mm_and_si128(_mm_srli_epi16(b128, 4), m0f),
-                                         _mm_and_si128(b128, m0f));
+            for (j = 0; j < 4; ++j) {
+                /* Mirror the single-vector kernel's layout: 32 bytes of qs
+                 * cover two 32-element groups — low nibbles then high
+                 * nibbles — with scales/mins interleaved as sc[2j], sc[2j+1].
+                 * An earlier version sliced qs linearly in 16-byte chunks,
+                 * which scrambled both the byte order and the scale pairing. */
+                const __m256i q256 = _mm256_loadu_si256((const __m256i *)(qs + j * 32));
+                const __m256i m0f256 = _mm256_set1_epi8(0x0F);
+                const __m256i wlo  = _mm256_and_si256(q256, m0f256);
+                const __m256i whi  = _mm256_and_si256(_mm256_srli_epi16(q256, 4), m0f256);
 
                 for (i = 0; i < tc; ++i) {
-                    const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + sb * 8 + j];
+                    const nita_aq8_t *ai0 = &a[(size_t)(i0 + i) * stride + sb * 8 + 2 * j];
+                    const nita_aq8_t *ai1 = &a[(size_t)(i0 + i) * stride + sb * 8 + 2 * j + 1];
 
                     vacc[i] = _mm256_fmadd_ps(
-                                  dot_u8_vec(ai->qs, w8),
-                                  _mm256_set1_ps(d * (float)sc[j] * ai->d), vacc[i]);
-                    msum[i] += dmin * (float)mn[j] * ai->d * (float)ai->sum;
+                                  dot_u8_vec(ai0->qs, wlo),
+                                  _mm256_set1_ps(d * (float)sc[2 * j] * ai0->d), vacc[i]);
+                    vacc[i] = _mm256_fmadd_ps(
+                                  dot_u8_vec(ai1->qs, whi),
+                                  _mm256_set1_ps(d * (float)sc[2 * j + 1] * ai1->d), vacc[i]);
+                    msum[i] += dmin * (float)mn[2 * j]     * ai0->d * (float)ai0->sum;
+                    msum[i] += dmin * (float)mn[2 * j + 1] * ai1->d * (float)ai1->sum;
                 }
             }
         }
