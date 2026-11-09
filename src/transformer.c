@@ -39,6 +39,14 @@
 #endif
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <ctype.h>
+/* The pool speaks LONG everywhere; on Windows that is a 32-bit type, on
+ * POSIX a long is at least as wide, which is all the atomics need. */
+typedef long LONG;
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -396,8 +404,12 @@ int nita_model_tensor_report(const nita_model_t *m, const gguf_file_t *g)
 
         snprintf(role, sizeof role, "attn_norm[%d]", l);
         report_weight(g, role, &m->attn_norm[l], seen, &nseen, cap);
-        snprintf(role, sizeof role, "post_norm[%d]", l);
-        report_weight(g, role, &m->post_norm[l], seen, &nseen, cap);
+        if (m->is_qwen35) {
+            /* These arrays only exist for qwen35 hybrids; a llama-style model
+             * leaves them NULL and &NULL[l] would segfault (it did). */
+            snprintf(role, sizeof role, "post_norm[%d]", l);
+            report_weight(g, role, &m->post_norm[l], seen, &nseen, cap);
+        }
         snprintf(role, sizeof role, "ffn_norm[%d]", l);
         report_weight(g, role, &m->ffn_norm[l], seen, &nseen, cap);
         snprintf(role, sizeof role, "attn_q[%d]", l);
@@ -408,10 +420,12 @@ int nita_model_tensor_report(const nita_model_t *m, const gguf_file_t *g)
         report_weight(g, role, &m->attn_v[l], seen, &nseen, cap);
         snprintf(role, sizeof role, "attn_out[%d]", l);
         report_weight(g, role, &m->attn_out[l], seen, &nseen, cap);
-        snprintf(role, sizeof role, "attn_q_norm[%d]", l);
-        report_weight(g, role, &m->attn_q_norm[l], seen, &nseen, cap);
-        snprintf(role, sizeof role, "attn_k_norm[%d]", l);
-        report_weight(g, role, &m->attn_k_norm[l], seen, &nseen, cap);
+        if (m->is_qwen35) {
+            snprintf(role, sizeof role, "attn_q_norm[%d]", l);
+            report_weight(g, role, &m->attn_q_norm[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "attn_k_norm[%d]", l);
+            report_weight(g, role, &m->attn_k_norm[l], seen, &nseen, cap);
+        }
         snprintf(role, sizeof role, "ffn_gate[%d]", l);
         report_weight(g, role, &m->ffn_gate[l], seen, &nseen, cap);
         snprintf(role, sizeof role, "ffn_up[%d]", l);
@@ -457,6 +471,56 @@ int nita_bind_all(const gguf_file_t *g, nita_tensor_t *out, size_t cap)
         if (!bind_tensor(g, &out[i], g->tensors[i].name)) return -1;
 
     return (int)g->tensor_count;
+}
+
+/* F-02: every bound weight tensor must have a decoder in this build.
+ * Anything else is refused here, loudly, instead of reaching the kernels
+ * where an unknown type dequantises to zeros and the model emits garbage
+ * with no signal. Returns the first offending tensor, or NULL. */
+static const nita_tensor_t *unsupported_tensor(const nita_model_t *m)
+{
+    int l;
+
+    if (m->tok_embd.bound && !nita_type_supported(m->tok_embd.type)) return &m->tok_embd;
+    if (m->out_norm.bound && !nita_type_supported(m->out_norm.type)) return &m->out_norm;
+    if (!m->tied_output && m->out_proj.bound &&
+        !nita_type_supported(m->out_proj.type))
+        return &m->out_proj;
+
+    for (l = 0; l < m->n_layer; ++l) {
+#define NITA_CHECK_TENSOR(T)                                            \
+        do {                                                            \
+            const nita_tensor_t *_t = (T);                              \
+            if (_t && _t->bound && !nita_type_supported(_t->type))      \
+                return _t;                                              \
+        } while (0)
+        NITA_CHECK_TENSOR(&m->attn_norm[l]);
+        NITA_CHECK_TENSOR(&m->attn_q[l]);
+        NITA_CHECK_TENSOR(&m->attn_k[l]);
+        NITA_CHECK_TENSOR(&m->attn_v[l]);
+        NITA_CHECK_TENSOR(&m->attn_out[l]);
+        NITA_CHECK_TENSOR(&m->ffn_gate[l]);
+        NITA_CHECK_TENSOR(&m->ffn_up[l]);
+        NITA_CHECK_TENSOR(&m->ffn_down[l]);
+        if (m->is_qwen35) {
+            NITA_CHECK_TENSOR(&m->attn_q_norm[l]);
+            NITA_CHECK_TENSOR(&m->attn_k_norm[l]);
+            NITA_CHECK_TENSOR(&m->post_norm[l]);
+            NITA_CHECK_TENSOR(&m->q35_w[l].qkv);
+            NITA_CHECK_TENSOR(&m->q35_w[l].gate);
+            NITA_CHECK_TENSOR(&m->q35_w[l].conv1d);
+            NITA_CHECK_TENSOR(&m->q35_w[l].alpha);
+            NITA_CHECK_TENSOR(&m->q35_w[l].beta);
+            NITA_CHECK_TENSOR(&m->q35_w[l].dt_bias);
+            NITA_CHECK_TENSOR(&m->q35_w[l].ssm_a);
+            NITA_CHECK_TENSOR(&m->q35_w[l].ssm_norm);
+            NITA_CHECK_TENSOR(&m->q35_w[l].out);
+        } else {
+            NITA_CHECK_TENSOR(&m->ffn_norm[l]);
+        }
+#undef NITA_CHECK_TENSOR
+    }
+    return NULL;
 }
 
 /* Read a hyperparameter, trying the model's own architecture prefix first. */
@@ -777,7 +841,16 @@ static void mv_rows_tile(const mv_range_t *j)
     }
 }
 
-#if defined(_WIN32)
+/* ------------------------------------------------------------------ */
+/* Row-parallel worker pool.                                           */
+/*                                                                     */
+/* One implementation for every platform. Workers are persistent, spin  */
+/* briefly on a generation counter, then park; the only platform seams  */
+/* are the wait primitive (Win32 events, or a pthread mutex/cond pair   */
+/* on POSIX) and thread create/join. The stall discipline, the          */
+/* claim-in-blocks row stealing and every ordering rule are identical   */
+/* on both.                                                             */
+/* ------------------------------------------------------------------ */
 struct mt_pool;
 typedef struct { struct mt_pool *pool; int id; } mt_arg_t;
 
@@ -803,8 +876,14 @@ typedef struct mt_pool {
     /* kind 2: a generic range job published by nita_parallel_for */
     nita_range_fn fn;
     void         *fn_ctx;
+#if defined(_WIN32)
     HANDLE        th[NITA_MAX_THREADS];
     HANDLE        ev[NITA_MAX_THREADS];
+#else
+    pthread_t       th[NITA_MAX_THREADS];
+    pthread_mutex_t mu[NITA_MAX_THREADS];
+    pthread_cond_t  cv[NITA_MAX_THREADS];
+#endif
     mt_arg_t      args[NITA_MAX_THREADS];
 
     /* Matvec rows are claimed in blocks rather than split once up front: a
@@ -818,12 +897,76 @@ typedef struct mt_pool {
 
 } mt_pool_t;
 
+/* Atomic helpers with identical semantics on both platforms. InterlockedAdd
+ * returns the NEW value; __atomic_add_fetch matches that, unlike the
+ * fetch-add form. */
+#if defined(_WIN32)
+static LONG pool_atomic_add(volatile LONG *p, LONG v) { return InterlockedAdd(p, v); }
+static void pool_atomic_store(volatile LONG *p, LONG v) { InterlockedExchange(p, v); }
+static LONG pool_atomic_inc(volatile LONG *p) { return InterlockedIncrement(p); }
+#else
+static LONG pool_atomic_add(volatile LONG *p, LONG v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+static void pool_atomic_store(volatile LONG *p, LONG v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
+static LONG pool_atomic_inc(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+#endif
+
+/* Ask one worker to sleep until the next generation (or a spurious wake,
+ * bounded to 5 ms). The waiting[] publication and the generation re-check
+ * both happen before/after the block respectively, so a job published to an
+ * about-to-sleep worker cannot be lost: it will re-check gen under the same
+ * protocol before its first sleep. */
+static void worker_block(mt_pool_t *pool, int id, LONG seen)
+{
+#if defined(_WIN32)
+    pool_atomic_store(&pool->waiting[id], 1);
+    if (pool->gen == seen) WaitForSingleObject(pool->ev[id], 5);
+    pool_atomic_store(&pool->waiting[id], 0);
+#else
+    struct timespec ts;
+
+    /* Publishing intent before locking (both sides ordered by an atomic op)
+     * is what stops a lost wake-up here. */
+    pool_atomic_store(&pool->waiting[id], 1);
+    pthread_mutex_lock(&pool->mu[id]);
+    while (pool->gen == seen && !pool->shutdown) {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 5L * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&pool->cv[id], &pool->mu[id], &ts);
+    }
+    pthread_mutex_unlock(&pool->mu[id]);
+    pool_atomic_store(&pool->waiting[id], 0);
+#endif
+}
+
+/* Wake one worker if (and only if) it is parked. The gen bump already
+ * precedes this call, so an unparked worker sees the job on its own and a
+ * signal to a parked worker is always matched by a generation re-check. */
+static void worker_wake(mt_pool_t *pool, int id)
+{
+#if defined(_WIN32)
+    if (pool->waiting[id]) SetEvent(pool->ev[id]);
+#else
+    if (pool->waiting[id]) {
+        pthread_mutex_lock(&pool->mu[id]);
+        pthread_cond_signal(&pool->cv[id]);
+        pthread_mutex_unlock(&pool->mu[id]);
+    }
+#endif
+}
+
 /* The pool model_open builds, visible to code that has no model handle (the
  * qwen35 mixer) but must run inside the same threads. Cleared when the model
  * that owns it is freed. */
 static mt_pool_t *g_pool;
 
+#if defined(_WIN32)
+#  define NITA_WORKER_RET 0
 static DWORD WINAPI mt_worker(LPVOID p)
+#else
+#  define NITA_WORKER_RET NULL
+static void *mt_worker(void *p)
+#endif
 {
     mt_arg_t  *a    = (mt_arg_t *)p;
     mt_pool_t *pool = a->pool;
@@ -833,20 +976,16 @@ static DWORD WINAPI mt_worker(LPVOID p)
     for (;;) {
         LONG spins = 0;
 
-        if (pool->shutdown) return 0;
+        if (pool->shutdown) return NITA_WORKER_RET;
 
         /* Spin briefly - back-to-back matvecs arrive with no gap at all - and
-         * then block on the event, so the other cores are not burnt while the
-         * master runs the serial parts of a layer. */
+         * then park, so the other cores are not burnt while the master runs
+         * the serial parts of a layer. */
         while (pool->gen == seen) {
-            if (pool->shutdown) return 0;
+            if (pool->shutdown) return NITA_WORKER_RET;
             if (++spins < pool->spin) { NITA_PAUSE(); continue; }
-            /* Publishing intent before reading gen (both sides ordered by an
-             * interlocked op) is what stops a lost wake-up here. */
-            InterlockedExchange(&pool->waiting[id], 1);
-            if (pool->gen == seen) WaitForSingleObject(pool->ev[id], 5);
-            InterlockedExchange(&pool->waiting[id], 0);
-            if (pool->shutdown) return 0;
+            worker_block(pool, id, seen);
+            if (pool->shutdown) return NITA_WORKER_RET;
         }
         seen = pool->gen;
 
@@ -856,7 +995,7 @@ static DWORD WINAPI mt_worker(LPVOID p)
 
         if (pool->kind == 2 && pool->row_step > 0) {
             for (;;) {
-                LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+                LONG lo = pool_atomic_add(&pool->row_next, pool->row_step) - pool->row_step;
                 LONG hi;
 
                 if (lo >= pool->row_end) break;
@@ -869,7 +1008,7 @@ static DWORD WINAPI mt_worker(LPVOID p)
 
             j.rowbuf = pool->rowbufs[id];
             for (;;) {
-                LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+                LONG lo = pool_atomic_add(&pool->row_next, pool->row_step) - pool->row_step;
                 LONG hi;
 
                 if (lo >= pool->row_end) break;
@@ -897,7 +1036,7 @@ static DWORD WINAPI mt_worker(LPVOID p)
                 mv_rows(&j);
             }
         }
-        InterlockedIncrement(&pool->completed);
+        pool_atomic_inc(&pool->completed);
     }
 }
 
@@ -924,9 +1063,9 @@ static mt_pool_t *pool_create(int n, size_t rowcap)
     if (!pool) return NULL;
     pool->n = n;
 
-    /* How long a worker spins before blocking on its event. Back-to-back
-     * matvecs have no gap, so a short spin is nearly free; the knob exists
-     * because the right value is machine and workload dependent.
+    /* How long a worker spins before parking. Back-to-back matvecs have no
+     * gap, so a short spin is nearly free; the knob exists because the right
+     * value is machine and workload dependent.
      * NITA_SPIN=0 means never block (maximum throughput, burns the cores). */
     {
         const char *e = getenv("NITA_SPIN");
@@ -941,11 +1080,27 @@ static mt_pool_t *pool_create(int n, size_t rowcap)
         if (!pool->rowbufs[i]) { pool->n = 1; break; }
     }
     for (i = 1; i < n; ++i) {
-        pool->ev[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
         pool->args[i].pool = pool;
         pool->args[i].id   = i;
+#if defined(_WIN32)
+        pool->ev[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (!pool->ev[i]) { pool->n = i; break; }
         pool->th[i] = CreateThread(NULL, 0, mt_worker, &pool->args[i], 0, NULL);
         if (!pool->th[i]) { pool->n = i; break; }   /* degrade gracefully */
+#else
+        if (pthread_mutex_init(&pool->mu[i], NULL) != 0) { pool->n = i; break; }
+        if (pthread_cond_init(&pool->cv[i], NULL) != 0) {
+            pthread_mutex_destroy(&pool->mu[i]);
+            pool->n = i;
+            break;
+        }
+        if (pthread_create(&pool->th[i], NULL, mt_worker, &pool->args[i]) != 0) {
+            pthread_mutex_destroy(&pool->mu[i]);
+            pthread_cond_destroy(&pool->cv[i]);
+            pool->n = i;
+            break;                                  /* degrade gracefully */
+        }
+#endif
     }
     return pool;
 }
@@ -956,19 +1111,30 @@ static void pool_destroy(mt_pool_t *pool)
     if (!pool) return;
     if (g_pool == pool) g_pool = NULL;
 
-    InterlockedExchange(&pool->have_job, 0);   /* no stale job may run */
-    InterlockedExchange(&pool->shutdown, 1);
-    InterlockedIncrement(&pool->gen);
+    pool_atomic_store(&pool->have_job, 0);   /* no stale job may run */
+    pool_atomic_store(&pool->shutdown, 1);
+    pool_atomic_inc(&pool->gen);
 
     for (i = 1; i < pool->n; ++i) {
+#if defined(_WIN32)
         if (pool->ev[i]) SetEvent(pool->ev[i]);
         if (pool->th[i]) {
             WaitForSingleObject(pool->th[i], 2000);
             CloseHandle(pool->th[i]);
         }
+#else
+        pthread_mutex_lock(&pool->mu[i]);
+        pthread_cond_signal(&pool->cv[i]);
+        pthread_mutex_unlock(&pool->mu[i]);
+        pthread_join(pool->th[i], NULL);
+        pthread_mutex_destroy(&pool->mu[i]);
+        pthread_cond_destroy(&pool->cv[i]);
+#endif
     }
+#if defined(_WIN32)
     for (i = 1; i < pool->n; ++i)
         if (pool->ev[i]) CloseHandle(pool->ev[i]);
+#endif
     for (i = 0; i < pool->n; ++i) free(pool->rowbufs[i]);
     free(pool);
 }
@@ -1021,14 +1187,13 @@ void nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx)
         pool->row_end  = n;
         pool->row_next = 0;
     }
-    InterlockedExchange(&pool->have_job, 1);
-    InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
+    pool_atomic_store(&pool->have_job, 1);
+    pool_atomic_inc(&pool->gen);          /* full barrier: job visible */
 
-    for (i = 1; i < pool->n; ++i)
-        if (pool->waiting[i]) SetEvent(pool->ev[i]);
+    for (i = 1; i < pool->n; ++i) worker_wake(pool, i);
 
     for (;;) {
-        LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+        LONG lo = pool_atomic_add(&pool->row_next, pool->row_step) - pool->row_step;
         LONG hi;
 
         if (lo >= pool->row_end) break;
@@ -1063,17 +1228,16 @@ static void mv_dispatch(mt_pool_t *pool, mv_range_t *job)
     } else {
         pool->row_step = 0;
     }
-    InterlockedExchange(&pool->have_job, 1);
-    InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
+    pool_atomic_store(&pool->have_job, 1);
+    pool_atomic_inc(&pool->gen);          /* full barrier: job visible */
 
-    for (i = 1; i < pool->n; ++i)
-        if (pool->waiting[i]) SetEvent(pool->ev[i]);
+    for (i = 1; i < pool->n; ++i) worker_wake(pool, i);
 
     if (pool->row_step > 0) {
         mv_range_t mine = *job;
 
         for (;;) {
-            LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+            LONG lo = pool_atomic_add(&pool->row_next, pool->row_step) - pool->row_step;
             LONG hi;
 
             if (lo >= pool->row_end) break;
@@ -1126,11 +1290,10 @@ static void att_dispatch(nita_model_t *m, int layer, int pos0, int ncol)
     pool->att_pos0  = pos0;
     pool->job.lo    = 0;
     pool->job.hi    = (uint64_t)ncol;          /* published before the bump */
-    InterlockedExchange(&pool->have_job, 1);
-    InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
+    pool_atomic_store(&pool->have_job, 1);
+    pool_atomic_inc(&pool->gen);          /* full barrier: job visible */
 
-    for (i = 1; i < pool->n; ++i)
-        if (pool->waiting[i]) SetEvent(pool->ev[i]);
+    for (i = 1; i < pool->n; ++i) worker_wake(pool, i);
 
     /* The calling thread takes slice 0, exactly as mv_dispatch does. With a
      * tile of 8 rows and 16 participants that slice is empty, which is fine:
@@ -1138,27 +1301,6 @@ static void att_dispatch(nita_model_t *m, int layer, int pos0, int ncol)
     attention_rows(m, layer, pos0, 0, (int)((uint64_t)ncol / (uint64_t)pool->n));
     while (pool->completed < pool->n - 1) NITA_PAUSE();
 }
-#else
-/* Portable fallback: single-threaded. */
-typedef struct { int n; } mt_pool_t;
-static void mv_dispatch(mt_pool_t *pool, mv_range_t *job) { (void)pool; mv_rows(job); }
-static void att_dispatch(nita_model_t *m, int layer, int pos0, int ncol)
-{
-    attention_rows(m, layer, pos0, 0, ncol);
-}
-static void pool_destroy(mt_pool_t *pool) { (void)pool; }
-void nita_parallel_for(int n, nita_range_fn fn, void *ctx)
-{
-    if (fn && n > 0) fn(ctx, 0, n, 0);
-}
-void nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx)
-{
-    (void)min_items;
-    if (fn && n > 0) fn(ctx, 0, n, 0);
-}
-float *nita_thread_rowbuf(int thread) { (void)thread; return NULL; }
-int    nita_thread_count(void) { return 1; }
-#endif
 
 /* Integer kernels are the default; NITA_INT8_DOT=0 restores the
  * dequantise-then-float path for an A/B on the same binary. */
@@ -1295,10 +1437,57 @@ static void rmsnorm(float *out, const float *x, const float *w, int n, float eps
     float  scale;
     double _t0 = prof_now();
 
+#if defined(__AVX2__)
+    {
+        /* Same double-precision accumulation, four doubles per lane pair,
+         * two independent accumulators; reorder is below the double rounding
+         * noise the scalar form already carries. */
+        __m256d acc0 = _mm256_setzero_pd();
+        __m256d acc1 = _mm256_setzero_pd();
+        int     i2   = 0;
+
+        for (; i2 + 16 <= n; i2 += 16) {
+            __m256  xf0 = _mm256_loadu_ps(x + i2);
+            __m256  xf1 = _mm256_loadu_ps(x + i2 + 8);
+            __m256d a0  = _mm256_cvtps_pd(_mm256_castps256_ps128(xf0));
+            __m256d b0  = _mm256_cvtps_pd(_mm256_extractf128_ps(xf0, 1));
+            __m256d a1  = _mm256_cvtps_pd(_mm256_castps256_ps128(xf1));
+            __m256d b1  = _mm256_cvtps_pd(_mm256_extractf128_ps(xf1, 1));
+
+            acc0 = _mm256_fmadd_pd(a0, a0, acc0);
+            acc0 = _mm256_fmadd_pd(b0, b0, acc0);
+            acc1 = _mm256_fmadd_pd(a1, a1, acc1);
+            acc1 = _mm256_fmadd_pd(b1, b1, acc1);
+        }
+        {
+            __m256d acc = _mm256_add_pd(acc0, acc1);
+            __m128d s   = _mm_hadd_pd(_mm256_castpd256_pd128(acc),
+                                      _mm256_extractf128_pd(acc, 1));
+            ss         += _mm_cvtsd_f64(s) + _mm_cvtsd_f64(_mm_unpackhi_pd(s, s));
+        }
+        for (; i2 < n; ++i2) ss += (double)x[i2] * (double)x[i2];
+    }
+#else
     for (i = 0; i < n; ++i) ss += (double)x[i] * (double)x[i];
+#endif
     ss /= (double)n;
     scale = 1.0f / sqrtf((float)ss + eps);
+#if defined(__AVX2__)
+    {
+        const __m256 vs = _mm256_set1_ps(scale);
+        int          i3 = 0;
+
+        for (; i3 + 8 <= n; i3 += 8) {
+            __m256 vx = _mm256_loadu_ps(x + i3);
+            __m256 vw = _mm256_loadu_ps(w + i3);
+
+            _mm256_storeu_ps(out + i3, _mm256_mul_ps(_mm256_mul_ps(vx, vs), vw));
+        }
+        for (; i3 < n; ++i3) out[i3] = x[i3] * scale * w[i3];
+    }
+#else
     for (i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
+#endif
     prof_add(&P_norm, prof_now() - _t0, 1);
 }
 
@@ -1730,6 +1919,52 @@ static int default_threads(int logical)
     if (cores > 0) return cores > logical ? logical : cores;
     return logical > 1 ? logical / 2 : 1;
 }
+#else
+/* Physical cores via sysfs topology, the same target the Windows path aims
+ * at: SMT siblings share a core's issue width and add little to a
+ * memory-bound matvec. Count unique (package, core) pairs; any failure
+ * falls back to the old logical/2 estimate. */
+static int default_threads(int logical)
+{
+    DIR           *d = opendir("/sys/devices/system/cpu");
+    struct dirent *e;
+    int            cores = 0, nseen = 0;
+    int            seen_pkg[4096], seen_core[4096];
+
+    if (!d) goto fallback;
+    while ((e = readdir(d))) {
+        char  path[512], buf[64];
+        FILE *f;
+        int   pkg = -1, core = -1, i, dup = 0;
+
+        if (strncmp(e->d_name, "cpu", 3) != 0 || !isdigit((unsigned char)e->d_name[3]))
+            continue;
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/%s/topology/physical_package_id",
+                 e->d_name);
+        if ((f = fopen(path, "r"))) {
+            if (fgets(buf, sizeof buf, f)) pkg = atoi(buf);
+            fclose(f);
+        }
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/%s/topology/core_id", e->d_name);
+        if ((f = fopen(path, "r"))) {
+            if (fgets(buf, sizeof buf, f)) core = atoi(buf);
+            fclose(f);
+        }
+        if (core < 0) continue;
+        for (i = 0; i < nseen; ++i)
+            if (seen_pkg[i] == pkg && seen_core[i] == core) { dup = 1; break; }
+        if (!dup && nseen < (int)(sizeof seen_pkg / sizeof seen_pkg[0])) {
+            seen_pkg[nseen] = pkg;
+            seen_core[nseen] = core;
+            ++nseen;
+        }
+    }
+    closedir(d);
+    cores = nseen;
+    if (cores > 0) return cores > logical ? logical : cores;
+fallback:
+    return logical > 1 ? logical / 2 : 1;
+}
 #endif
 
 nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t errlen)
@@ -1933,6 +2168,20 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
         if (!bind_tensor(g, &m->ffn_down[l], name)) goto missing_layer;
     }
 
+    /* F-02 gate: refuse unsupported quants before any kernel sees them. */
+    {
+        const nita_tensor_t *bad = unsupported_tensor(m);
+
+        if (bad) {
+            snprintf(err, errlen,
+                     "tensor '%s' uses quant type %u which this build cannot "
+                     "decode; refusing to load rather than emit zeros",
+                     bad->name, (unsigned)bad->type);
+            free_model(m);
+            return NULL;
+        }
+    }
+
     /* qwen35 mixer geometry and per-layer recurrent state */
     if (m->is_qwen35) {
         const int64_t inner = hparam_int(g, arch, "ssm.inner_size", 0);
@@ -2024,20 +2273,27 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
 
     /* Worker pool. Projections are the whole cost of a token and split
      * perfectly by row, so this is where the cores go. */
-#if defined(_WIN32)
     {
-        SYSTEM_INFO si;
         const char *env = getenv("NITA_THREADS");
         int         nt;
 
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+
         GetSystemInfo(&si);
         nt = default_threads((int)si.dwNumberOfProcessors);
+#else
+        {
+            long np = sysconf(_SC_NPROCESSORS_ONLN);
+
+            nt = default_threads(np > 0 ? (int)np : 1);
+        }
+#endif
         if (env) { int v = atoi(env); if (v > 0) nt = v; }
         if (nt < 1) nt = 1;
         m->pool = pool_create(nt, m->rowcap);
         g_pool  = (mt_pool_t *)m->pool;
     }
-#endif
 
     /* KV cache */
     m->k_cache = (float **)nita_calloc((size_t)m->n_layer, sizeof(float *));

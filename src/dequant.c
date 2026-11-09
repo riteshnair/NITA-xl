@@ -959,3 +959,56 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
         return -1;
     }
 }
+
+/* True when this type has a decoder the engine can run: every id the switch
+ * above handles. Anything else must be refused at load time -- an
+ * unsupported quant would silently dequantise to zeros and every output
+ * would be garbage with no signal to the caller. */
+int nita_type_supported(uint32_t type)
+{
+    switch (type) {
+    /* unquantised / float / integer */
+    case 0:    /* F32   */
+    case 1:    /* F16   */
+    case 24:   /* I8    */
+    case 25:   /* I16   */
+    case 26:   /* I32   */
+    case 27:   /* I64   */
+    case 28:   /* F64   */
+    case 30:   /* BF16  */
+    /* standard k-quants */
+    case 2:    /* Q4_0  */
+    case 3:    /* Q4_1  */
+    case 6:    /* Q5_0  */
+    case 7:    /* Q5_1  */
+    case 8:    /* Q8_0  */
+    case 9:    /* Q8_1  */
+    case 10:   /* Q2_K  */
+    case 11:   /* Q3_K  */
+    case 12:   /* Q4_K  */
+    case 13:   /* Q5_K  */
+    case 14:   /* Q6_K  */
+    case 15:   /* Q8_K  */
+    /* importance-matrix quants */
+    case 16:   /* IQ2_XXS */
+    case 17:   /* IQ2_XS  */
+    case 18:   /* IQ3_XXS */
+    case 19:   /* IQ1_S   */
+    case 20:   /* IQ4_NL  */
+    case 21:   /* IQ3_S   */
+    case 22:   /* IQ2_S   */
+    case 23:   /* IQ4_XS  */
+    case 29:   /* IQ1_M   */
+    case 39:   /* MXFP4   */
+    /* binary / ternary */
+    case 34:   /* TQ1_0   */
+    case 35:   /* TQ2_0   */
+    case 41:   /* Q1_0    */
+    case 42:   /* Q2_0    */
+    case 142:  /* PQ2_0   */
+    case 143:  /* PTQ1_0  */
+        return 1;
+    default:
+        return 0;
+    }
+}

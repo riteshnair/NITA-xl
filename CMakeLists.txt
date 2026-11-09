@@ -317,7 +317,10 @@ foreach(_model ${NITA_TEST_MODELS})
     # --all walks the tensor table and tests every quantised type the file
     # stores, so this entry does not have to name a type id that could drift.
     add_test(NAME quant_dot@${_tag} COMMAND quant_dot_test --all "${_model}")
-    set_tests_properties(q35_probe@${_tag} quant_dot@${_tag}
+    # The sequential-vs-fused arbiter: catches a tile-kernel layout mistake
+    # (the Q4_K AVX2 bug) that the float reference cannot see.
+    add_test(NAME quant_tile@${_tag} COMMAND quant_dot_test --tile "${_model}")
+    set_tests_properties(q35_probe@${_tag} quant_dot@${_tag} quant_tile@${_tag}
                          PROPERTIES LABELS "checkpoint")
 
     # The engine's own reader cannot vouch for an offset it read wrongly: a
