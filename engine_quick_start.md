@@ -1,57 +1,76 @@
-# Pure‑LLVM‑IR CPU‑only GGUF Inference Engine – Quick Start Guide
-**Date:** 6 Nov 2026  
+# NITA – Quick Start (corrected 2026-11-09)
 
-## 1️⃣ Folder Layout
+> This document previously described a non-existent "pure LLVM-IR / MLIR"
+> engine with `iree-import-gguf`, an ORC-lite driver, `-DBMC`/`-DLM_CACHE`/
+> `-DSPEC_WIDTH` flags and a `validate_engine_components()` startup
+> assertion. None of that exists in this repository and it never has. This
+> file now documents the engine that is actually here: a plain C11 program
+> built with CMake, AVX2 where available, with a scalar fallback path.
+
+## Folder layout (real)
+
 ```
-LLVM-IR/
-├─ weights/            ← GGUF model files (e.g. llama-2-7B-q4_k_m.gguf)
-├─ mlir/               ← intermediate MLIR files
-├─ ir/                 ← lowered LLVM IR (.ll, .bc, .o)
-├─ src/
-│   ├─ main.cpp        ← ORC‑lite driver
-│   └─ q4_matmul.c     ← fused quantised kernel
-├─ build/              ← CMake output
-├─ quant_table.md      ← quant type mandate table
-├─ component_spec.md   ← component specifications
-├─ sherlock_spec.md    ← tracing & breadcrumbs
-├─ validation_spec.md  ← component re‑check
-└─ CMakeLists.txt
+NITA-xl/
+├─ CMakeLists.txt      build (x86-64; -march=znver3 if accepted, else -mavx2,
+│                      else baseline; override with -DNITA_ARCH=znver3|avx2|none)
+├─ src/                the engine (see README "Layout")
+├─ tests/              CTest entry points
+├─ tools/              reference models, gguf_probe.py, comparators
+├─ quant_table.md      what the engine can decode, corrected
+├─ validation_spec.md  what is actually validated, corrected
+├─ component_spec.md   the real components and their checks, corrected
+└─ sherlock_spec.md    the real SHERLOCK_LITE / BREADCRUMB macros, corrected
 ```
 
-## 2️⃣ CMake Configuration
+## Build
+
 ```bash
-mkdir -p build && cd build
-cmake .. \
-  -DLLVM_ROOT=/usr/lib/llvm-18 \          # adjust to your LLVM install
-  -DENABLE_BMC=ON \
-  -DLM_CACHE=ON \
-  -DMEO=ON \          # enable MoE hot‑expert handling
-  -DSPEC_WIDTH=4 \    # speculative decode width (2‑4)
-  -DDEBUG_BREADCRUMBS=ON \
-  -DSHERLOCK_LITE=ON
-cmake --build . -j$(nproc)
+cmake -B build -G Ninja
+cmake --build build -j$(nproc)
+ctest --test-dir build            # base suite (5 tests)
+# checkpoint tests (Bonsai/TinyLlama files):
+cmake -B build -G Ninja -DNITA_TEST_MODELS=/path/to/model.gguf
+ctest --test-dir build -L checkpoint
 ```
 
-## 3️⃣ Run the Engine
+## Run
+
 ```bash
-./bin/minimal_inference ir/model.o "Once upon a time" 64
+./build/nita --model tinyllama.gguf --port 7777          # serve (OpenAI API)
+./build/nita --model tinyllama.gguf --inspect            # GGUF dump, exit
+./build/nita --model tinyllama.gguf --tensor-table       # tab-separated table
+./build/nita --model tinyllama.gguf --logits "text"      # forward pass, logits
+./build/nita --model tinyllama.gguf --bench 32 --reps 5  # decode timing
 ```
-- The binary first prints a validation assert (all components OK).
-- Then it outputs the sherlock‑light table to stdout.
-- Breadcrumbs appear on `stderr` if `DEBUG_BREADCRUMBS` was compiled in.
 
-## 4️⃣ Toggle Features at Runtime (CMake flags)
-| Feature | CMake Flag | Effect |
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
+(`"stream": true` supported; SSE is assembled after generation, not
+token-incremental).
+
+## Runtime knobs (real ones)
+
+| Knob | Where | Meaning |
 |---|---|---|
-| BMC KV‑cache | `-DBMC` | Eliminates per‑token `memcpy`; redundant rows for in‑place update |
-| LM‑cache | `-DLM_CACHE` | Keeps quantised weight tiles in RAM; layer‑wise mixed‑precision |
-| Mixture‑of‑Experts | `-DMEO` | Keeps `E` experts in L3 (~120 MB), loads/rest from disk LRU |
-| Speculative decode | `-DSPEC_WIDTH=N` | Draft‑then‑verify with N tokens (N=2‑4) |
-| Hot‑cold KV buckets | `-DHC_BUCKET` | Keeps hot tiles in L3, spills cold to RAM |
-| Prefetching | `-DPREFETCH` | `llvm.prefetch` before next‑token fetch |
-| LTCG | `-DLTO` | Whole‑program optimisation, constant‑folding of tile scales |
+| `NITA_THREADS` | env | decode threads (default: auto, ≤32) |
+| `NITA_PREFILL_SEQ=1` | env | force one-token-at-a-time prefill (tiled path is default) |
+| `NITA_REP_SPREAD` | env | bench spread warning threshold (percent) |
+| `-DNITA_ARCH` | CMake | `znver3` (default where accepted) / `avx2` / `none` (portable baseline) |
+| `-DNITA_TEST_MODELS` | CMake | checkpoint(s) for the checkpoint test entries |
+| `-DNITA_TEST_SLOW=ON` | CMake | register fork_match on checkpoints >1 GiB |
+| `-DDEBUG_BREADCRUMBS=ON` | CMake | stderr breadcrumb trace (see sherlock_spec.md) |
+| `-DSHERLOCK_LITE=ON` | CMake | component timing table on stdout |
 
-## 4️⃣ Validation on Startup
-The binary runs `validate_engine_components()` at launch and aborts with a clear message if any check fails (missing GGUF token, MLIR pass failure, kernel quant mismatch, trace init failure, MoE expert validation). This is the “internal re‑check” demanded by the user.
+The CMake quantisation options (`-DTERNARY`, `-DGPTQ`, `-DAWQ`, …) only set a
+**label** reported by `--version` and the served `system_fingerprint`; they do
+not select a kernel, there is no other "quantised GEMV" to enable. Weight
+layout is chosen per tensor type at load time by the integer dot kernels in
+`src/quant.c`.
 
----
+## What does not exist
+
+MLIR/IREE front-end, `model.o`, ORC-lite driver, `-DBMC`, `-DLM_CACHE`,
+`-DMEO`, `-DSPEC_WIDTH`, `-DSELECTIVE_DEQUANT`, `iree-import-gguf`,
+`validate_engine_components()`, speculative decode, MoE expert caches, GPTQ/AWQ
+kernel lowering passes, `static_assert`-based startup validation. Any document,
+script or log line referring to those is stale (see the spec docs, all corrected
+2026-11-09) or aspirational, not a description of this codebase.

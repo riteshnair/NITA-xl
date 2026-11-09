@@ -1,7 +1,8 @@
 # NITA (NC Inference Tool for All)
 
 CPU-only GGUF inference engine with an OpenAI-compatible HTTP API.
-AVX2 target (AMD Zen3), quantised weights dequantised per row on demand.
+x86-64; AVX2 (AMD Zen3) when the compiler accepts it, tested scalar baseline,
+quantised weights dequantised per row on demand.
 
 ## What works
 
@@ -782,7 +783,8 @@ curl -X POST http://localhost:7777/v1/chat/completions \
 ```
 
 Add `"stream": true` for server-sent events in the OpenAI chunk format,
-terminated by `data: [DONE]`.
+terminated by `data: [DONE]`. The stream is assembled after generation
+completes and then written as one burst of chunks; it is not token-incremental.
 
 `system_fingerprint` reports which path served the request:
 
@@ -972,10 +974,15 @@ A 27B token is now 122 ms of matvec
 work (6 of them the delta rule) and about 10 ms of embedding, rotations and
 sampling.
 
-The pool exists on Windows only; elsewhere the same code runs one thread.
-Against llama.cpp, what is still missing is runtime ISA dispatch (the build
-hardcodes `-march=znver3 -mavx2`, so it faults on a CPU without AVX2), a pool on
-Linux and macOS, and a backend seam for GPU work. The KV cache is
+The thread pool is portable (pthreads on POSIX, native threads on Windows) and
+is used on both. Build-time architecture selection replaces the old
+`-march=znver3 -mavx2` hardcode: configure picks `-march=znver3` when the
+compiler accepts it, else `-mavx2`, else a plain x86-64 baseline (override with
+`-DNITA_ARCH=znver3|avx2|none`). All AVX2 intrinsics sit behind `__AVX2__`
+guards with scalar fallbacks, and the baseline build is verified: 5/5 CTest
+entries pass and its logits match the AVX2 build to 7e-6 (identical argmax) on
+TinyLlama. What is still missing is *runtime* ISA dispatch — a binary built
+with AVX2 faults on a pre-AVX2 CPU — and a backend seam for GPU work. The KV cache is
 `2 x n_layer x ctx x (n_head_kv * head_dim) x 4` bytes, so a 32-layer model
 with 4096-wide KV at 2048 context needs roughly 2 GB of cache.
 
@@ -990,12 +997,11 @@ src/json.c         JSON parser and escaper
 src/tokenizer.c    vocabulary + encode/decode
 src/transformer.c  tensor binding, forward pass, sampling, generation
 src/qwen35.c       gated delta-net mixer for the Bonsai hybrid architecture
-src/quant.c        IQ4_XS / MXFP4 / TQ1_0 codecs and integer dot kernels
+src/quant.c        integer dot kernels (all K-quants) + IQ4_XS / MXFP4 / TQ1_0 codecs
 src/hadamard.c     block Hadamard rotation folded into the Bonsai matmuls
 src/chat.c         conversation history and completion path
 src/http.c         HTTP/1.1 server and OpenAI routes
 src/main.c         CLI entry point
-src/q4_matmul.c    quantised GEMV kernels
 tests/             CTest entry points (see Tests under Build)
 tools/             model generators, reference implementation, comparators
 ```
