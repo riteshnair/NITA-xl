@@ -395,7 +395,10 @@ static int route_chat_completions(sock_t s, const nita_server_t *srv,
     stream = json_bool(json_object_get(root, "stream"), false);
     max_tokens = (int)json_number(json_object_get(root, "max_tokens"),
                                   (double)srv->ctx_size);
-    temperature = (float)json_number(json_object_get(root, "temperature"), 0.8);
+    /* Coherent output is the default: with no temperature in the request we
+     * sample greedily. Tiny/base models (stories class) produce word salad at
+     * 0.8, and a caller that wants randomness can always ask for it. */
+    temperature = (float)json_number(json_object_get(root, "temperature"), 0.0);
     top_k = (int)json_number(json_object_get(root, "top_k"), 40);
 
     chat_history_init(&history);

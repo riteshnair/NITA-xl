@@ -354,6 +354,7 @@ tokenizer_t *tokenizer_from_gguf(const gguf_file_t *g)
     }
 
     t->has_vocab = true;
+    t->has_sp_marker = vocab_lookup(t, SP_MARKER, SP_MARKER_LEN) >= 0;
     build_byte_fallback(t);
 
     BREADCRUMBF("tokenizer", "vocabulary: %u pieces, mode=%s, merges=%u (bos=%d eos=%d unk=%d)",
@@ -433,10 +434,16 @@ static int32_t *encode_greedy(const tokenizer_t *t, const char *text, size_t *ou
     size_t   cap = 16, count = 0;
 
     nbuf_init(&esc);
-    nbuf_puts(&esc, SP_MARKER);
-    for (i = 0; i < in_len; ++i) {
-        if (text[i] == ' ') nbuf_puts(&esc, SP_MARKER);
-        else                nbuf_putc(&esc, text[i]);
+    if (t->has_sp_marker) {
+        /* SentencePiece-style vocabulary: spaces become U+2581. */
+        nbuf_puts(&esc, SP_MARKER);
+        for (i = 0; i < in_len; ++i) {
+            if (text[i] == ' ') nbuf_puts(&esc, SP_MARKER);
+            else                nbuf_putc(&esc, text[i]);
+        }
+    } else {
+        /* Raw byte-level vocabulary: identity mapping, no escaping. */
+        nbuf_puts(&esc, text);
     }
 
     len = esc.len;
@@ -655,6 +662,15 @@ static int32_t *encode_spm(const tokenizer_t *t, const char *text, size_t *out_c
     return ids;
 }
 
+/* Look up a whole piece in the vocabulary; -1 when absent. Public so the
+ * chat layer can tell whether a model speaks a special token set (e.g.
+ * ChatML) before wrapping prompts in it. */
+int32_t tokenizer_find(const tokenizer_t *t, const char *piece)
+{
+    if (!t || !t->has_vocab || !piece) return -1;
+    return vocab_lookup(t, piece, strlen(piece));
+}
+
 int32_t *tokenizer_encode(const tokenizer_t *t, const char *text, size_t *out_count)
 {
     *out_count = 0;
@@ -721,14 +737,20 @@ void tokenizer_append_piece(const tokenizer_t *t, int32_t id, nbuf_t *out)
         return;
     }
 
-    /* sentencepiece: U+2581 becomes a space. */
-    while (*piece) {
-        if (memcmp(piece, SP_MARKER, SP_MARKER_LEN) == 0) {
-            nbuf_putc(out, ' ');
-            piece += SP_MARKER_LEN;
-        } else {
-            nbuf_putc(out, *piece++);
+    if (t->has_sp_marker) {
+        /* sentencepiece: U+2581 becomes a space. */
+        while (*piece) {
+            if (memcmp(piece, SP_MARKER, SP_MARKER_LEN) == 0) {
+                nbuf_putc(out, ' ');
+                piece += SP_MARKER_LEN;
+            } else {
+                nbuf_putc(out, *piece++);
+            }
         }
+    } else {
+        /* Raw byte-level vocabulary: append the piece verbatim. */
+        size_t len = strlen(piece);
+        nbuf_append(out, piece, len);
     }
 }
 
@@ -747,7 +769,7 @@ char *tokenizer_decode(const tokenizer_t *t, const int32_t *ids, size_t count)
 
     /* SentencePiece tokenizers prefix every text with U+2581, which decodes
      * to one leading space. Drop exactly one so decode(encode(x)) == x. */
-    if (t->mode != TOK_MODE_BPE && s[0] == ' ')
+    if (t->has_sp_marker && s[0] == ' ')
         memmove(s, s + 1, strlen(s));
 
     return s;

@@ -247,6 +247,12 @@ typedef struct {
     uint32_t   merge_cap;
     uint32_t   n_merges;
 
+    /* True when the vocabulary contains the sentencepiece U+2581 marker
+     * ("▁"). Only then do the GREEDY encoder/decoder perform the
+     * space->▁ and ▁->space transformations; a raw byte-level vocabulary
+     * (single-byte tokens, e.g. a byte model) encodes identity instead. */
+    bool       has_sp_marker;
+
     /* Raw byte -> single token id, used when a byte has no vocabulary entry. */
     int32_t    byte_token_id[256];
 } tokenizer_t;
@@ -259,6 +265,8 @@ void         tokenizer_free(tokenizer_t *t);
 /* Encode text to token ids. Returns malloc'd array (caller frees). */
 int32_t     *tokenizer_encode(const tokenizer_t *t, const char *text,
                               size_t *out_count);
+/* Look up a whole piece in the vocabulary; -1 when absent. */
+int32_t      tokenizer_find(const tokenizer_t *t, const char *piece);
 /* Decode token ids back to a malloc'd NUL-terminated string. */
 char        *tokenizer_decode(const tokenizer_t *t, const int32_t *ids, size_t count);
 /* Append the printable form of one token to a text stream. */
@@ -287,7 +295,8 @@ void chat_history_free(chat_history_t *h);
 void chat_history_clear(chat_history_t *h);
 int  chat_history_push(chat_history_t *h, chat_role_t role, const char *content);
 /* Render the conversation into a prompt string using the model's template. */
-char *chat_render_prompt(const gguf_file_t *g, const chat_history_t *h);
+char *chat_render_prompt(const gguf_file_t *g, const tokenizer_t *tok,
+                         const chat_history_t *h);
 
 /* Result of a completion request. */
 typedef struct {
