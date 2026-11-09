@@ -77,7 +77,8 @@ static void print_usage(FILE *f, const char *argv0)
         "                      one pass (NITA_PREFILL_SEQ=1 for the old\n"
         "                      one-token-at-a-time path)\n"
         "  --bench <n>         measure decode throughput and dump the component\n"
-        "                      profile (n single-token forwards)\n"
+        "                      profile (n single-token forwards; NITA_TRACE=1\n"
+        "                      prints the tag-only time trace)\n"
         "  --reps <n>          runs per benchmark, reported as a median with a\n"
         "                      spread warning (default 5; NITA_REP_SPREAD sets\n"
         "                      the warning threshold in percent)\n"
@@ -510,6 +511,7 @@ static void rep_print_profile(const rep_set_t *r)
     int             i, k;
 
     if (nprof <= 0) return;
+    if (!nita_trace_enabled()) return;
 
     for (i = 0; i < nprof; ++i) {
         double us[NITA_MAX_REPS], calls[NITA_MAX_REPS];
@@ -531,6 +533,35 @@ static void rep_print_profile(const rep_set_t *r)
         if (!med[i].subset) tot += med[i].us;
     }
     if (tot <= 0.0) tot = 1.0;
+
+    /* NITA_TRACE=1: the runtime trace, just the tags - one line per tag,
+     * highest total first. NITA_TRACE=0: silence even in a lit build.
+     * Unset: the detailed table (only reached in a -DSHERLOCK_LITE build,
+     * since otherwise every probe stayed branch-skipped and every row is 0,
+     * which the !nita_trace_enabled() guard above already silences). */
+    if (nita_trace_mode() == 1) {
+        int order[NITA_PROF_MAX_ROWS];
+
+        for (i = 0; i < nprof; ++i) order[i] = i;
+        for (i = 1; i < nprof; ++i) {          /* insertion sort, desc by us */
+            int    o   = order[i], j = i - 1;
+            double key = med[o].us;
+
+            while (j >= 0 && med[order[j]].us < key) {
+                order[j + 1] = order[j];
+                --j;
+            }
+            order[j + 1] = o;
+        }
+        for (i = 0; i < nprof; ++i) {
+            const nita_prof_row_t *r = &med[order[i]];
+
+            if (r->us <= 0.0) continue;
+            printf("[trace] %-16s %.3f ms\n", r->name, r->us / 1000.0);
+        }
+        fflush(stdout);
+        return;
+    }
 
     printf("%-16s%8s%14s%12s%8s\n", "component", "calls", "total_us", "us/call", "%");
     for (i = 0; i < nprof; ++i) {

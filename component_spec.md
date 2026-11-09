@@ -16,7 +16,7 @@
 | C7 | Tokenizer | `src/tokenizer.c` – BPE (byte-level, `tokenizer.ggml.merges`) + SentencePiece score merge, byte fallback | – | `tokenizer@spm`, `tokenizer@bpe` (tools/reference_tokenizer.py vs engine) |
 | C8 | Chat/completion | `src/chat.c` – history, plain vs ChatML prompt rendering (ChatML only when the checkpoint ships a template or ChatML vocab), completion accounting | – | exercised via the HTTP endpoint; `fp_nita_stub` fingerprint when weights are unusable |
 | C9 | HTTP/OpenAI API | `src/http.c` – `/health`, `/v1/models`, `/v1/chat/completions` (+SSE) | – | manual smoke (see validation_spec.md); sequential accept loop by design |
-| C10| Tracing | `src/nita.h` – `BREADCRUMB[F]` → stderr (`-DDEBUG_BREADCRUMBS`); `SHERLOCK_*` → tag lines on stdout and the `transformer.c`/`qwen35.c` component profiler, all compiled out unless `-DSHERLOCK_LITE` — a default build contains no probe code | both off by default | nothing asserted; they are diagnostics, not features |
+| C10| Tracing | `src/nita.h` – `BREADCRUMB[F]` → stderr (`-DDEBUG_BREADCRUMBS`); `NITA_TRACE=1` (runtime, tag-only sorted timings); `-DSHERLOCK_LITE=ON` (detailed component table); disabled probes = one predictable branch per site, no probe work | both off by default | nothing asserted; they are diagnostics, not features |
 
 ## Notes
 
