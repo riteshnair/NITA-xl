@@ -338,6 +338,7 @@ typedef struct {
     uint32_t       type;
     uint64_t       ne0;      /* input width  */
     uint64_t       ne1;      /* output height */
+    uint64_t       ne2;      /* experts (3-D weights), else 1 */
     bool           bound;
     /* The GGUF tensor this was bound from, so a report can say which weight a
      * field holds instead of only where its pointer landed. */

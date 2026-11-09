@@ -219,6 +219,42 @@ struct nita_model {
     nita_tensor_t *ffn_up;
     nita_tensor_t *ffn_down;
 
+    /* Mixture of experts. Two checkpoint flavours reach this path: llama-arch
+     * MoE (Mixtral-style, e.g. Tiny-Moe) which renormalises the selected
+     * expert weights, and qwen2moe (Qwen2.5-MoE) which does not and carries a
+     * sigmoid-gated shared expert. Everything is derived from the GGUF: the
+     * expert count from metadata, the per-expert FFN width from the expert
+     * tensor shapes. A model with expert_count == 0 leaves all of this NULL. */
+    bool           is_moe;
+    int            n_expert;
+    int            expert_used;
+    int            n_ff_exp;
+    int            n_ff_shexp;      /* 0 when there is no shared expert    */
+    int            moe_norm_w;      /* llama-style weight renormalisation   */
+    float          exp_w_scale;     /* expert_weights_scale; 0 = unset      */
+    nita_tensor_t *ffn_gate_inp;    /* [n_layer] router   [n_embd, n_expert] */
+    nita_tensor_t *ffn_gate_exps;   /* [n_layer] [n_embd, n_ff_exp, n_expert] */
+    nita_tensor_t *ffn_up_exps;     /* [n_layer] [n_embd, n_ff_exp, n_expert] */
+    nita_tensor_t *ffn_down_exps;   /* [n_layer] [n_ff_exp, n_embd, n_expert] */
+    nita_tensor_t *shexp_gate_inp;  /* [n_layer] 1-D [n_embd]                */
+    nita_tensor_t *shexp_gate;      /* [n_layer] [n_embd, n_ff_shexp]        */
+    nita_tensor_t *shexp_up;        /* [n_layer] [n_embd, n_ff_shexp]        */
+    nita_tensor_t *shexp_down;      /* [n_layer] [n_ff_shexp, n_embd]        */
+    /* Optional attention / output biases (Qwen2 carries q/k/v biases). */
+    nita_tensor_t *attn_q_bias;     /* [n_layer] or NULL when the arch has none */
+    nita_tensor_t *attn_k_bias;
+    nita_tensor_t *attn_v_bias;
+    nita_tensor_t *attn_out_bias;
+    nita_tensor_t  out_bias;        /* optional output.bias (tied: unused)  */
+    float         *acc;              /* [n_embd] MoE expert accumulation     */
+    float         *router;           /* [n_expert] router logits then probs  */
+    int           *sel;              /* [expert_used] selected expert ids    */
+    float         *sel_w;            /* [expert_used] their gate weights     */
+    unsigned char *sel_taken;        /* [n_expert] selection marker          */
+    float         *biasbuf;          /* scratch for 1-D vectors (biases,     */
+                                    /* shared-expert gate input)            */
+    float         *out_bias_f32;     /* dequantised once at load, or NULL   */
+
     /* KV cache: one contiguous buffer per layer */
     float **k_cache;
     float **v_cache;
@@ -324,6 +360,18 @@ static bool bound_in_file(const gguf_file_t *g, const nita_tensor_t *t)
     return t->bound && t->data != NULL;
 }
 
+/* The GGUF table entry for `name`, or NULL. Used to tell "bias tensor is
+ * absent" (fine) from "bias tensor is present but unusable" (fatal). */
+static const gguf_tensor_t *tensor_named(const gguf_file_t *g, const char *name)
+{
+    uint64_t i;
+
+    if (!g || !name) return NULL;
+    for (i = 0; i < g->tensor_count; ++i)
+        if (strcmp(g->tensors[i].name, name) == 0) return &g->tensors[i];
+    return NULL;
+}
+
 static bool bind_tensor(const gguf_file_t *g, nita_tensor_t *t, const char *name)
 {
     uint64_t i;
@@ -333,13 +381,17 @@ static bool bind_tensor(const gguf_file_t *g, nita_tensor_t *t, const char *name
 
     for (i = 0; i < g->tensor_count; ++i) {
         const gguf_tensor_t *src = &g->tensors[i];
-        size_t               row, need;
+        size_t               row;
+        uint64_t             need, mult, k;
         uint64_t             abs_off;
 
         if (strcmp(src->name, name) != 0) continue;
 
         row  = nita_row_bytes(src->type, src->n_dims > 0 ? src->dims[0] : 0);
-        need = row * (size_t)(src->n_dims > 1 ? src->dims[1] : 1);
+        mult = 1;
+        for (k = 1; k < src->n_dims; ++k)
+            if (src->dims[k]) mult *= src->dims[k];
+        need = row * (size_t)mult;
         abs_off = g->data_offset + src->offset;
 
         if (abs_off > g->file_size || need > g->file_size - abs_off) {
@@ -351,6 +403,7 @@ static bool bind_tensor(const gguf_file_t *g, nita_tensor_t *t, const char *name
         t->type  = src->type;
         t->ne0   = src->n_dims > 0 ? src->dims[0] : 0;
         t->ne1   = src->n_dims > 1 ? src->dims[1] : 1;
+        t->ne2   = src->n_dims > 2 ? src->dims[2] : 1;
         t->bound = true;
         snprintf(t->name, sizeof t->name, "%s", name);
         return true;
@@ -435,6 +488,38 @@ int nita_model_tensor_report(const nita_model_t *m, const gguf_file_t *g)
         snprintf(role, sizeof role, "ffn_down[%d]", l);
         report_weight(g, role, &m->ffn_down[l], seen, &nseen, cap);
 
+        if (m->is_moe) {
+            snprintf(role, sizeof role, "ffn_gate_inp[%d]", l);
+            report_weight(g, role, &m->ffn_gate_inp[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "ffn_gate_exps[%d]", l);
+            report_weight(g, role, &m->ffn_gate_exps[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "ffn_up_exps[%d]", l);
+            report_weight(g, role, &m->ffn_up_exps[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "ffn_down_exps[%d]", l);
+            report_weight(g, role, &m->ffn_down_exps[l], seen, &nseen, cap);
+            if (m->n_ff_shexp > 0) {
+                snprintf(role, sizeof role, "shexp_gate_inp[%d]", l);
+                report_weight(g, role, &m->shexp_gate_inp[l], seen, &nseen, cap);
+                snprintf(role, sizeof role, "shexp_gate[%d]", l);
+                report_weight(g, role, &m->shexp_gate[l], seen, &nseen, cap);
+                snprintf(role, sizeof role, "shexp_up[%d]", l);
+                report_weight(g, role, &m->shexp_up[l], seen, &nseen, cap);
+                snprintf(role, sizeof role, "shexp_down[%d]", l);
+                report_weight(g, role, &m->shexp_down[l], seen, &nseen, cap);
+            }
+        }
+        if (!m->is_qwen35) {
+            snprintf(role, sizeof role, "attn_q_bias[%d]", l);
+            report_weight(g, role, &m->attn_q_bias[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "attn_k_bias[%d]", l);
+            report_weight(g, role, &m->attn_k_bias[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "attn_v_bias[%d]", l);
+            report_weight(g, role, &m->attn_v_bias[l], seen, &nseen, cap);
+            snprintf(role, sizeof role, "attn_out_bias[%d]", l);
+            report_weight(g, role, &m->attn_out_bias[l], seen, &nseen, cap);
+        }
+        if (!m->tied_output) { } /* out_bias reported once, below */
+
         if (m->is_qwen35 && m->layer_recr[l]) {
             snprintf(role, sizeof role, "ssm_qkv[%d]", l);
             report_weight(g, role, &m->q35_w[l].qkv, seen, &nseen, cap);
@@ -485,6 +570,7 @@ static const nita_tensor_t *unsupported_tensor(const nita_model_t *m)
 
     if (m->tok_embd.bound && !nita_type_supported(m->tok_embd.type)) return &m->tok_embd;
     if (m->out_norm.bound && !nita_type_supported(m->out_norm.type)) return &m->out_norm;
+    if (m->out_bias.bound && !nita_type_supported(m->out_bias.type)) return &m->out_bias;
     if (!m->tied_output && m->out_proj.bound &&
         !nita_type_supported(m->out_proj.type))
         return &m->out_proj;
@@ -504,6 +590,24 @@ static const nita_tensor_t *unsupported_tensor(const nita_model_t *m)
         NITA_CHECK_TENSOR(&m->ffn_gate[l]);
         NITA_CHECK_TENSOR(&m->ffn_up[l]);
         NITA_CHECK_TENSOR(&m->ffn_down[l]);
+        if (m->is_moe) {
+            NITA_CHECK_TENSOR(&m->ffn_gate_inp[l]);
+            NITA_CHECK_TENSOR(&m->ffn_gate_exps[l]);
+            NITA_CHECK_TENSOR(&m->ffn_up_exps[l]);
+            NITA_CHECK_TENSOR(&m->ffn_down_exps[l]);
+            if (m->n_ff_shexp > 0) {
+                NITA_CHECK_TENSOR(&m->shexp_gate_inp[l]);
+                NITA_CHECK_TENSOR(&m->shexp_gate[l]);
+                NITA_CHECK_TENSOR(&m->shexp_up[l]);
+                NITA_CHECK_TENSOR(&m->shexp_down[l]);
+            }
+        }
+        if (!m->is_qwen35) {
+            NITA_CHECK_TENSOR(&m->attn_q_bias[l]);
+            NITA_CHECK_TENSOR(&m->attn_k_bias[l]);
+            NITA_CHECK_TENSOR(&m->attn_v_bias[l]);
+            NITA_CHECK_TENSOR(&m->attn_out_bias[l]);
+        }
         if (m->is_qwen35) {
             NITA_CHECK_TENSOR(&m->attn_q_norm[l]);
             NITA_CHECK_TENSOR(&m->attn_k_norm[l]);
@@ -1434,6 +1538,33 @@ static int matvec_tile(nita_model_t *m, const nita_tensor_t *t,
 }
 
 
+/* y += dequantised bias vector b (1-D). Absent bias is not an error. */
+static int add_bias(nita_model_t *m, const nita_tensor_t *b, float *y, int n)
+{
+    if (!b || !b->bound) return 0;
+    if (load_vector(b, m->biasbuf, n) != 0) return -1;
+    for (int i = 0; i < n; ++i) y[i] += m->biasbuf[i];
+    return 0;
+}
+
+/* One expert's slice of a packed 3-D expert weight. */
+static int matvec_expert(nita_model_t *m, const nita_tensor_t *t, int e,
+                         const float *x, float *y, int expect_in, int expect_out,
+                         prof_t *slot)
+{
+    nita_tensor_t v;
+    size_t        slice;
+
+    if (!bound_in_file(NULL, t)) return -1;
+    if ((int)t->ne0 != expect_in || (int)t->ne1 != expect_out) return -2;
+
+    slice = (size_t)t->ne1 * nita_row_bytes(t->type, t->ne0);
+    v     = *t;
+    v.data = t->data + (size_t)e * slice;
+    v.ne2  = 1;
+    return matvec(m, &v, x, y, expect_in, expect_out, slot);
+}
+
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps)
 {
     double ss = 0.0;
@@ -1850,6 +1981,12 @@ static void free_model(nita_model_t *m)
     free(m->attn_norm); free(m->attn_q); free(m->attn_k); free(m->attn_v);
     free(m->attn_out);  free(m->ffn_norm); free(m->ffn_gate);
     free(m->ffn_up);    free(m->ffn_down);
+    free(m->ffn_gate_inp); free(m->ffn_gate_exps); free(m->ffn_up_exps);
+    free(m->ffn_down_exps);
+    free(m->shexp_gate_inp); free(m->shexp_gate); free(m->shexp_up); free(m->shexp_down);
+    free(m->attn_q_bias); free(m->attn_k_bias); free(m->attn_v_bias); free(m->attn_out_bias);
+    free(m->acc); free(m->router); free(m->sel); free(m->sel_w); free(m->sel_taken);
+    free(m->biasbuf); free(m->out_bias_f32);
 
     if (m->q35_state) {
         for (l = 0; l < m->n_layer; ++l)
@@ -2068,6 +2205,26 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
 
     m->tied_output = !bind_tensor(g, &m->out_proj, "output.weight");
     if (m->tied_output) m->out_proj = m->tok_embd;
+    if (tensor_named(g, "output.bias")) {
+        if (!bind_tensor(g, &m->out_bias, "output.bias")) {
+            snprintf(err, errlen, "tensor 'output.bias' failed the bounds check");
+            free_model(m);
+            return NULL;
+        }
+        if ((int)m->out_bias.ne0 != m->n_vocab) {
+            snprintf(err, errlen, "output.bias has %llu elements, expected %d",
+                     (unsigned long long)m->out_bias.ne0, m->n_vocab);
+            free_model(m);
+            return NULL;
+        }
+        m->out_bias_f32 = (float *)nita_calloc((size_t)m->n_vocab, sizeof(float));
+        if (!m->out_bias_f32 ||
+            load_vector(&m->out_bias, m->out_bias_f32, m->n_vocab) != 0) {
+            snprintf(err, errlen, "could not dequantise output.bias");
+            free_model(m);
+            return NULL;
+        }
+    }
 
     /* Per-layer tensors */
     m->attn_norm = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->attn_norm);
@@ -2084,6 +2241,53 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
      * Upstream decides by position: a layer is recurrent unless
      * (layer + 1) % full_attention_interval == 0. */
     m->is_qwen35 = (strcmp(arch, "qwen35") == 0);
+    /* MoE: expert_count in metadata (llama-arch MoE uses the llama.* keys,
+     * qwen2moe uses qwen2moe.*). qwen35 hybrids are not MoE. */
+    m->is_moe = !m->is_qwen35 &&
+        hparam_int(g, arch, "expert_count", 0) > 0;
+    if (m->is_moe) {
+        m->n_expert    = (int)hparam_int(g, arch, "expert_count", 0);
+        m->expert_used = (int)hparam_int(g, arch, "expert_used_count", 1);
+        m->exp_w_scale = (float)hparam_float(g, arch, "expert_weights_scale", 0.0);
+        /* llama.cpp hard-codes weight renormalisation for llama-arch MoE and
+         * leaves it off for qwen2moe; both honour expert_weights_scale. */
+        m->moe_norm_w  = (strcmp(arch, "qwen2moe") != 0) ? 1 : 0;
+        if (m->expert_used <= 0 || m->expert_used > m->n_expert) {
+            snprintf(err, errlen,
+                     "expert_used_count %d out of range for %d experts",
+                     m->expert_used, m->n_expert);
+            free_model(m);
+            return NULL;
+        }
+        m->ffn_gate_inp  = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->ffn_gate_inp);
+        m->ffn_gate_exps = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->ffn_gate_exps);
+        m->ffn_up_exps   = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->ffn_up_exps);
+        m->ffn_down_exps = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->ffn_down_exps);
+        m->shexp_gate_inp= (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->shexp_gate_inp);
+        m->shexp_gate    = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->shexp_gate);
+        m->shexp_up      = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->shexp_up);
+        m->shexp_down    = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->shexp_down);
+        if (!m->ffn_gate_inp || !m->ffn_gate_exps || !m->ffn_up_exps ||
+            !m->ffn_down_exps || !m->shexp_gate_inp || !m->shexp_gate ||
+            !m->shexp_up || !m->shexp_down) {
+            snprintf(err, errlen, "out of memory for MoE layer tables");
+            free_model(m);
+            return NULL;
+        }
+    }
+    if (!m->is_qwen35) {
+        /* Optional attention biases (Qwen2/Qwen2.5 carry q/k/v biases).
+         * Bind is best-effort; absent tensors stay unbound. */
+        m->attn_q_bias   = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->attn_q_bias);
+        m->attn_k_bias   = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->attn_k_bias);
+        m->attn_v_bias   = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->attn_v_bias);
+        m->attn_out_bias = (nita_tensor_t *)nita_calloc((size_t)m->n_layer, sizeof *m->attn_out_bias);
+        if (!m->attn_q_bias || !m->attn_k_bias || !m->attn_v_bias || !m->attn_out_bias) {
+            snprintf(err, errlen, "out of memory for bias tables");
+            free_model(m);
+            return NULL;
+        }
+    }
     if (m->is_qwen35) {
         int64_t interval = hparam_int(g, arch, "full_attention_interval", 4);
 
@@ -2163,12 +2367,183 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
                 if (!bind_tensor(g, &m->ffn_norm[l], name)) goto missing_layer;
             }
         }
-        snprintf(name, sizeof name, "blk.%d.ffn_gate.weight", l);
-        if (!bind_tensor(g, &m->ffn_gate[l], name)) goto missing_layer;
-        snprintf(name, sizeof name, "blk.%d.ffn_up.weight", l);
-        if (!bind_tensor(g, &m->ffn_up[l], name)) goto missing_layer;
-        snprintf(name, sizeof name, "blk.%d.ffn_down.weight", l);
-        if (!bind_tensor(g, &m->ffn_down[l], name)) goto missing_layer;
+        if (!m->is_qwen35) {
+            /* Optional attention biases: absent is fine, present-but-unbound
+             * is fatal (never run with a silent zero-bias fallback). */
+            nita_tensor_t *bias_dst[4];
+            const char    *bias_name[4];
+            int             bi;
+
+            bias_dst[0] = &m->attn_q_bias[l];
+            bias_dst[1] = &m->attn_k_bias[l];
+            bias_dst[2] = &m->attn_v_bias[l];
+            bias_dst[3] = &m->attn_out_bias[l];
+            bias_name[0] = "attn_q.bias";
+            bias_name[1] = "attn_k.bias";
+            bias_name[2] = "attn_v.bias";
+            bias_name[3] = "attn_output.bias";
+            for (bi = 0; bi < 4; ++bi) {
+                char bias_full[96];
+
+                snprintf(bias_full, sizeof bias_full, "blk.%d.%s", l, bias_name[bi]);
+                if (tensor_named(g, bias_full) && !bind_tensor(g, bias_dst[bi], bias_full)) {
+                    snprintf(err, errlen,
+                             "layer %d '%s' is present but failed the bounds check",
+                             l, bias_full);
+                    free_model(m);
+                    return NULL;
+                }
+            }
+        }
+        if (m->is_moe) {
+            snprintf(name, sizeof name, "blk.%d.ffn_gate_inp.weight", l);
+            if (!bind_tensor(g, &m->ffn_gate_inp[l], name)) goto missing_layer;
+            snprintf(name, sizeof name, "blk.%d.ffn_gate_exps.weight", l);
+            if (!bind_tensor(g, &m->ffn_gate_exps[l], name)) goto missing_layer;
+            snprintf(name, sizeof name, "blk.%d.ffn_up_exps.weight", l);
+            if (!bind_tensor(g, &m->ffn_up_exps[l], name)) goto missing_layer;
+            snprintf(name, sizeof name, "blk.%d.ffn_down_exps.weight", l);
+            if (!bind_tensor(g, &m->ffn_down_exps[l], name)) goto missing_layer;
+            /* Shared expert (Qwen2.5-MoE always has one; llama-arch MoE files
+             * may not). All-or-nothing: a gate input without its projections
+             * is a malformed checkpoint, not a smaller model. */
+            snprintf(name, sizeof name, "blk.%d.ffn_gate_inp_shexp.weight", l);
+            if (bind_tensor(g, &m->shexp_gate_inp[l], name)) {
+                snprintf(name, sizeof name, "blk.%d.ffn_gate_shexp.weight", l);
+                if (!bind_tensor(g, &m->shexp_gate[l], name)) goto missing_layer;
+                snprintf(name, sizeof name, "blk.%d.ffn_up_shexp.weight", l);
+                if (!bind_tensor(g, &m->shexp_up[l], name)) goto missing_layer;
+                snprintf(name, sizeof name, "blk.%d.ffn_down_shexp.weight", l);
+                if (!bind_tensor(g, &m->shexp_down[l], name)) goto missing_layer;
+            } else if (strcmp(arch, "qwen2moe") == 0) {
+                snprintf(err, errlen,
+                         "qwen2moe layer %d is missing 'blk.%d.ffn_gate_inp_shexp.weight'",
+                         l, l);
+                free_model(m);
+                return NULL;
+            }
+        } else {
+            snprintf(name, sizeof name, "blk.%d.ffn_gate.weight", l);
+            if (!bind_tensor(g, &m->ffn_gate[l], name)) goto missing_layer;
+            snprintf(name, sizeof name, "blk.%d.ffn_up.weight", l);
+            if (!bind_tensor(g, &m->ffn_up[l], name)) goto missing_layer;
+            snprintf(name, sizeof name, "blk.%d.ffn_down.weight", l);
+            if (!bind_tensor(g, &m->ffn_down[l], name)) goto missing_layer;
+        }
+    }
+
+    /* MoE geometry validation: everything is checked against the tensor
+     * shapes, not against hope. Experts must be uniform across layers and
+     * match the router width. */
+    if (m->is_moe) {
+        int ff_exp = -1, ff_shexp = -1, has_shexp = -1;
+
+        for (l = 0; l < m->n_layer; ++l) {
+            const nita_tensor_t *gi = &m->ffn_gate_inp[l];
+            const nita_tensor_t *ge = &m->ffn_gate_exps[l];
+            const nita_tensor_t *ue = &m->ffn_up_exps[l];
+            const nita_tensor_t *de = &m->ffn_down_exps[l];
+
+            if ((int)gi->ne0 != m->n_embd || (int)gi->ne1 != m->n_expert) {
+                snprintf(err, errlen, "layer %d ffn_gate_inp is %llux%llu, expected %dx%d",
+                         l, (unsigned long long)gi->ne0, (unsigned long long)gi->ne1,
+                         m->n_embd, m->n_expert);
+                free_model(m); return NULL;
+            }
+            if ((int)ge->ne0 != m->n_embd || (int)ge->ne2 != m->n_expert ||
+                (int)ue->ne0 != m->n_embd || (int)ue->ne2 != m->n_expert ||
+                ue->ne1 != ge->ne1) {
+                snprintf(err, errlen, "layer %d expert gate/up shapes are inconsistent", l);
+                free_model(m); return NULL;
+            }
+            if ((int)de->ne0 != (int)ge->ne1 || (int)de->ne1 != m->n_embd ||
+                (int)de->ne2 != m->n_expert) {
+                snprintf(err, errlen, "layer %d expert down shape is inconsistent", l);
+                free_model(m); return NULL;
+            }
+            if (ff_exp == -1) ff_exp = (int)ge->ne1;
+            else if (ff_exp != (int)ge->ne1) {
+                snprintf(err, errlen, "layer %d expert FFN width %d differs from %d",
+                         l, (int)ge->ne1, ff_exp);
+                free_model(m); return NULL;
+            }
+            if (m->shexp_gate_inp[l].bound) {
+                const nita_tensor_t *sg = &m->shexp_gate_inp[l];
+                const nita_tensor_t *sgt = &m->shexp_gate[l];
+                const nita_tensor_t *sup = &m->shexp_up[l];
+                const nita_tensor_t *sdn = &m->shexp_down[l];
+
+                if (sg->ne1 != 1 || (int)sg->ne0 != m->n_embd) {
+                    snprintf(err, errlen, "layer %d ffn_gate_inp_shexp is not a 1-D %d-vector",
+                             l, m->n_embd);
+                    free_model(m); return NULL;
+                }
+                if ((int)sgt->ne0 != m->n_embd || sgt->ne1 != sup->ne1 ||
+                    (int)sup->ne0 != m->n_embd) {
+                    snprintf(err, errlen, "layer %d shared expert gate/up shapes are inconsistent", l);
+                    free_model(m); return NULL;
+                }
+                if (sdn->ne0 != sgt->ne1 || (int)sdn->ne1 != m->n_embd) {
+                    snprintf(err, errlen, "layer %d shared expert down shape is inconsistent", l);
+                    free_model(m); return NULL;
+                }
+                if (ff_shexp == -1) ff_shexp = (int)sgt->ne1;
+                else if (ff_shexp != (int)sgt->ne1) {
+                    snprintf(err, errlen, "layer %d shared expert FFN width %d differs from %d",
+                             l, (int)sgt->ne1, ff_shexp);
+                    free_model(m); return NULL;
+                }
+                if (has_shexp == 0) {
+                    snprintf(err, errlen, "layer %d has a shared expert but earlier layers do not", l);
+                    free_model(m); return NULL;
+                }
+                has_shexp = 1;
+            } else {
+                if (has_shexp == 1) {
+                    snprintf(err, errlen, "layer %d is missing the shared expert other layers have", l);
+                    free_model(m); return NULL;
+                }
+                has_shexp = 0;
+            }
+        }
+        m->n_ff_exp   = ff_exp;
+        m->n_ff_shexp = has_shexp ? ff_shexp : 0;
+        if (strcmp(arch, "qwen2moe") == 0 && !has_shexp) {
+            snprintf(err, errlen, "qwen2moe checkpoint has no shared expert tensors");
+            free_model(m); return NULL;
+        }
+        printf("moe             : %d experts, top-%d, expert ff=%d, %s%d\n",
+               m->n_expert, m->expert_used, m->n_ff_exp,
+               has_shexp ? "shared expert ff=" : "no shared expert, norm_w=",
+               has_shexp ? m->n_ff_shexp : m->moe_norm_w);
+    }
+
+    /* Attention bias shapes must match the projections they amend. */
+    if (!m->is_qwen35 && m->attn_q_bias) {
+        const int q_dim_  = m->n_head * m->head_dim;
+
+        for (l = 0; l < m->n_layer; ++l) {
+            if (m->attn_q_bias[l].bound && (int)m->attn_q_bias[l].ne0 != q_dim_) {
+                snprintf(err, errlen, "layer %d attn_q.bias has %llu elements, expected %d",
+                         l, (unsigned long long)m->attn_q_bias[l].ne0, q_dim_);
+                free_model(m); return NULL;
+            }
+            if (m->attn_k_bias[l].bound && (int)m->attn_k_bias[l].ne0 != m->kv_dim) {
+                snprintf(err, errlen, "layer %d attn_k.bias has %llu elements, expected %d",
+                         l, (unsigned long long)m->attn_k_bias[l].ne0, m->kv_dim);
+                free_model(m); return NULL;
+            }
+            if (m->attn_v_bias[l].bound && (int)m->attn_v_bias[l].ne0 != m->kv_dim) {
+                snprintf(err, errlen, "layer %d attn_v.bias has %llu elements, expected %d",
+                         l, (unsigned long long)m->attn_v_bias[l].ne0, m->kv_dim);
+                free_model(m); return NULL;
+            }
+            if (m->attn_out_bias[l].bound && (int)m->attn_out_bias[l].ne0 != m->n_embd) {
+                snprintf(err, errlen, "layer %d attn_output.bias has %llu elements, expected %d",
+                         l, (unsigned long long)m->attn_out_bias[l].ne0, m->n_embd);
+                free_model(m); return NULL;
+            }
+        }
     }
 
     /* F-02 gate: refuse unsupported quants before any kernel sees them. */
@@ -2243,9 +2618,10 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
             (int)m->attn_k[l].ne0 != m->n_embd || (int)m->attn_k[l].ne1 != m->kv_dim ||
             (int)m->attn_v[l].ne0 != m->n_embd || (int)m->attn_v[l].ne1 != m->kv_dim ||
             (int)m->attn_out[l].ne0 != q_dim || (int)m->attn_out[l].ne1 != m->n_embd ||
-            (int)m->ffn_gate[l].ne0 != m->n_embd || (int)m->ffn_gate[l].ne1 != m->n_ff ||
-            (int)m->ffn_up[l].ne0 != m->n_embd || (int)m->ffn_up[l].ne1 != m->n_ff ||
-            (int)m->ffn_down[l].ne0 != m->n_ff || (int)m->ffn_down[l].ne1 != m->n_embd) {
+            (!m->is_moe &&
+             ((int)m->ffn_gate[l].ne0 != m->n_embd || (int)m->ffn_gate[l].ne1 != m->n_ff ||
+              (int)m->ffn_up[l].ne0 != m->n_embd || (int)m->ffn_up[l].ne1 != m->n_ff ||
+              (int)m->ffn_down[l].ne0 != m->n_ff || (int)m->ffn_down[l].ne1 != m->n_embd))) {
             snprintf(err, errlen, "layer %d tensor shapes are inconsistent", l);
             free_model(m);
             return NULL;
@@ -2253,23 +2629,49 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
     }
 
     /* Scratch buffers */
-    max_row = m->n_embd;
-    if (m->n_ff > max_row) max_row = m->n_ff;
-    m->rowbuf = (float *)nita_calloc((size_t)max_row, sizeof(float));
-    m->rowcap = (size_t)max_row;
+    {
+        int ff_scratch = m->n_ff;
 
-    m->nbuf  = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
-    m->xb    = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
-    m->hb    = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
-    m->qbuf  = (float *)nita_calloc((size_t)q_dim, sizeof(float));
-    m->kbuf  = (float *)nita_calloc((size_t)m->kv_dim, sizeof(float));
-    m->vbuf  = (float *)nita_calloc((size_t)m->kv_dim, sizeof(float));
-    m->abuf  = (float *)nita_calloc((size_t)q_dim, sizeof(float));
-    m->gate  = (float *)nita_calloc((size_t)m->n_ff, sizeof(float));
-    m->up    = (float *)nita_calloc((size_t)m->n_ff, sizeof(float));
-    m->ff    = (float *)nita_calloc((size_t)m->n_ff, sizeof(float));
-    m->tmp   = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
-    m->scores= (float *)nita_calloc((size_t)m->ctx, sizeof(float));
+        if (m->n_ff_exp > ff_scratch)   ff_scratch = m->n_ff_exp;
+        if (m->n_ff_shexp > ff_scratch) ff_scratch = m->n_ff_shexp;
+
+        max_row = m->n_embd > ff_scratch ? m->n_embd : ff_scratch;
+        m->rowbuf = (float *)nita_calloc((size_t)max_row, sizeof(float));
+        m->rowcap = (size_t)max_row;
+
+        m->nbuf  = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
+        m->xb    = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
+        m->hb    = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
+        m->qbuf  = (float *)nita_calloc((size_t)q_dim, sizeof(float));
+        m->kbuf  = (float *)nita_calloc((size_t)m->kv_dim, sizeof(float));
+        m->vbuf  = (float *)nita_calloc((size_t)m->kv_dim, sizeof(float));
+        m->abuf  = (float *)nita_calloc((size_t)q_dim, sizeof(float));
+        m->gate  = (float *)nita_calloc((size_t)ff_scratch, sizeof(float));
+        m->up    = (float *)nita_calloc((size_t)ff_scratch, sizeof(float));
+        m->ff    = (float *)nita_calloc((size_t)ff_scratch, sizeof(float));
+        m->tmp   = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
+        m->scores= (float *)nita_calloc((size_t)m->ctx, sizeof(float));
+        m->acc   = (float *)nita_calloc((size_t)m->n_embd, sizeof(float));
+        m->router= (float *)nita_calloc((size_t)(m->n_expert > 0 ? m->n_expert : 1), sizeof(float));
+        m->sel   = (int *)nita_calloc((size_t)(m->expert_used > 0 ? m->expert_used : 1), sizeof(int));
+        m->sel_w = (float *)nita_calloc((size_t)(m->expert_used > 0 ? m->expert_used : 1), sizeof(float));
+        m->sel_taken = (unsigned char *)nita_calloc((size_t)(m->n_expert > 0 ? m->n_expert : 1), 1);
+        {
+            int wide = m->n_embd;
+
+            if (q_dim > wide)   wide = q_dim;
+            if (m->kv_dim > wide) wide = m->kv_dim;
+            m->biasbuf = (float *)nita_calloc((size_t)wide, sizeof(float));
+        }
+        if (!m->rowbuf || !m->nbuf || !m->xb || !m->hb || !m->qbuf || !m->kbuf ||
+            !m->vbuf || !m->abuf || !m->gate || !m->up || !m->ff || !m->tmp ||
+            !m->scores || !m->acc || !m->router || !m->sel || !m->sel_w ||
+            !m->sel_taken || !m->biasbuf) {
+            snprintf(err, errlen, "out of memory for scratch buffers");
+            free_model(m);
+            return NULL;
+        }
+    }
 #if !defined(NITA_NO_ROPE_TAB)
     m->rope_tab = rope_build(m->ctx, m->n_rot, m->rope_theta);
 #endif
@@ -2453,6 +2855,78 @@ void nita_model_reset(nita_model_t *m)
 
 int nita_model_ctx(const nita_model_t *m)      { return m ? m->ctx : 0; }
 int nita_model_n_vocab(const nita_model_t *m)  { return m ? m->n_vocab : 0; }
+
+/* MoE feed-forward for one token. m->hb must hold the post-norm hidden
+ * state. Writes the weighted expert sum into m->acc (added to the residual
+ * by the caller). Mirrors llama.cpp: softmax router, top-k selection,
+ * optional weight renormalisation (llama-arch MoE), optional expert scale,
+ * optional sigmoid-gated shared expert (qwen2moe). */
+static int moe_ffn(nita_model_t *m, int l)
+{
+    const int E = m->n_expert, K = m->expert_used;
+    int       e, j, c;
+
+    if (matvec(m, &m->ffn_gate_inp[l], m->hb, m->router, m->n_embd, E, NULL) != 0)
+        return -1;
+    softmax_inplace(m->router, E);
+
+    memset(m->sel_taken, 0, (size_t)E);
+    for (j = 0; j < K; ++j) {
+        int best = -1;
+
+        for (e = 0; e < E; ++e) {
+            if (m->sel_taken[e]) continue;
+            if (best < 0 || m->router[e] > m->router[best]) best = e;
+        }
+        m->sel[j]           = best;
+        m->sel_taken[best]  = 1;
+        m->sel_w[j]         = m->router[best];
+    }
+    if (m->moe_norm_w) {
+        float s = 0.0f;
+
+        for (j = 0; j < K; ++j) s += m->sel_w[j];
+        /* llama.cpp clamps the divisor to the smallest F16 normal to avoid
+         * a zero-sum blow-up. */
+        if (s < 6.103515625e-5f) s = 6.103515625e-5f;
+        for (j = 0; j < K; ++j) m->sel_w[j] /= s;
+    }
+    if (m->exp_w_scale != 0.0f && m->exp_w_scale != 1.0f)
+        for (j = 0; j < K; ++j) m->sel_w[j] *= m->exp_w_scale;
+
+    memset(m->acc, 0, (size_t)m->n_embd * sizeof *m->acc);
+    for (j = 0; j < K; ++j) {
+        const int ee = m->sel[j];
+        const int ffw = m->n_ff_exp;
+
+        if (matvec_expert(m, &m->ffn_gate_exps[l], ee, m->hb, m->gate,
+                          m->n_embd, ffw, &P_pg) != 0) return -2;
+        if (matvec_expert(m, &m->ffn_up_exps[l],   ee, m->hb, m->up,
+                          m->n_embd, ffw, &P_pu) != 0) return -2;
+        silu_mul(m->ff, m->gate, m->up, ffw);
+        if (matvec_expert(m, &m->ffn_down_exps[l], ee, m->ff, m->tmp,
+                          ffw, m->n_embd, &P_pd) != 0) return -2;
+        for (c = 0; c < m->n_embd; ++c) m->acc[c] += m->sel_w[j] * m->tmp[c];
+    }
+
+    if (m->n_ff_shexp > 0) {
+        const int ffw = m->n_ff_shexp;
+        float     s   = 0.0f;
+
+        /* sigmoid(gate(x)); llama.cpp writes this as silu(x)/x, which is the
+         * same value everywhere except exactly at x == 0. */
+        if (load_vector(&m->shexp_gate_inp[l], m->biasbuf, m->n_embd) != 0) return -3;
+        for (c = 0; c < m->n_embd; ++c) s += m->hb[c] * m->biasbuf[c];
+        s = 1.0f / (1.0f + expf(-s));
+
+        if (matvec(m, &m->shexp_gate[l], m->hb, m->gate, m->n_embd, ffw, &P_pg) != 0) return -3;
+        if (matvec(m, &m->shexp_up[l],   m->hb, m->up,   m->n_embd, ffw, &P_pu) != 0) return -3;
+        silu_mul(m->ff, m->gate, m->up, ffw);
+        if (matvec(m, &m->shexp_down[l], m->ff, m->tmp, ffw, m->n_embd, &P_pd) != 0) return -3;
+        for (c = 0; c < m->n_embd; ++c) m->acc[c] += s * m->tmp[c];
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Forward pass                                                        */
@@ -2825,6 +3299,11 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
         if (matvec(m, &m->attn_q[l], m->hb, m->qbuf, m->n_embd, q_dim, &P_pq) != 0) return -6;
         if (matvec(m, &m->attn_k[l], m->hb, m->kbuf, m->n_embd, m->kv_dim, &P_pk) != 0) return -6;
         if (matvec(m, &m->attn_v[l], m->hb, m->vbuf, m->n_embd, m->kv_dim, &P_pv) != 0) return -6;
+        if (!m->is_qwen35) {
+            if (add_bias(m, &m->attn_q_bias[l], m->qbuf, q_dim) != 0) return -6;
+            if (add_bias(m, &m->attn_k_bias[l], m->kbuf, m->kv_dim) != 0) return -6;
+            if (add_bias(m, &m->attn_v_bias[l], m->vbuf, m->kv_dim) != 0) return -6;
+        }
 
         {
             double _tr = prof_now();
@@ -2847,6 +3326,8 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
         if (attention(m, l, pos) != 0) return -7;
         { char nm[32]; snprintf(nm, sizeof nm, "l%d.abuf", l); llama_dump(nm, m->abuf, q_dim); }
         if (matvec(m, &m->attn_out[l], m->abuf, m->tmp, q_dim, m->n_embd, &P_po) != 0) return -8;
+        if (!m->is_qwen35 &&
+            add_bias(m, &m->attn_out_bias[l], m->tmp, m->n_embd) != 0) return -8;
         { char nm[32]; snprintf(nm, sizeof nm, "l%d.attn_out", l); llama_dump(nm, m->tmp, m->n_embd); }
 
         {
@@ -2855,10 +3336,22 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
         }
         { char nm[32]; snprintf(nm, sizeof nm, "l%d.post_attn", l); llama_dump(nm, m->xb, m->n_embd); }
 
-        /* ---- feed-forward block (SwiGLU) ---- */
+        /* ---- feed-forward block (SwiGLU, or experts) ---- */
         if (load_vector(&m->ffn_norm[l], m->nbuf, m->n_embd) != 0) return -5;
         rmsnorm(m->hb, m->xb, m->nbuf, m->n_embd, m->rms_eps);
         { char nm[32]; snprintf(nm, sizeof nm, "l%d.ffn_in", l); llama_dump(nm, m->hb, m->n_embd); }
+
+        if (m->is_moe) {
+            if (moe_ffn(m, l) != 0) return -12;
+            memcpy(m->tmp, m->acc, (size_t)m->n_embd * sizeof(float));
+            { char nm[32]; snprintf(nm, sizeof nm, "l%d.ffn_out", l); llama_dump(nm, m->tmp, m->n_embd); }
+            {
+                int i;
+                for (i = 0; i < m->n_embd; ++i) m->xb[i] += m->tmp[i];
+            }
+            { char nm[32]; snprintf(nm, sizeof nm, "l%d.out", l); llama_dump(nm, m->xb, m->n_embd); }
+            continue;
+        }
 
         if (matvec(m, &m->ffn_gate[l], m->hb, m->gate, m->n_embd, m->n_ff, &P_pg) != 0) return -9;
         if (matvec(m, &m->ffn_up[l],   m->hb, m->up,   m->n_embd, m->n_ff, &P_pu) != 0) return -9;
@@ -2892,6 +3385,11 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
         double _to = prof_now();
         if (matvec(m, &m->out_proj, m->hb, logits, m->n_embd, m->n_vocab, NULL) != 0) return -11;
         prof_add(&P_out, prof_now() - _to, (long)m->n_vocab);
+    }
+    if (m->out_bias_f32) {
+        int i;
+
+        for (i = 0; i < m->n_vocab; ++i) logits[i] += m->out_bias_f32[i];
     }
 
     m->pos = pos + 1;
@@ -3195,9 +3693,10 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
     const char *seq;
     int         start, i, l, j;
 
-    if (m && m->is_qwen35) {
-        /* The hybrid graph decodes a token at a time; prefill by looping so
-         * generation works end to end. Only the last logits are wanted. */
+    if (m && (m->is_qwen35 || m->is_moe)) {
+        /* The expert graph and the hybrid graph decode a token at a time;
+         * prefill by looping so generation works end to end. Only the last
+         * logits are wanted. */
         for (i = 0; i < n; ++i)
             if (nita_forward(m, ids[i], logits) != 0) return -1;
         return 0;
@@ -3256,6 +3755,25 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
             if (matvec_tile(m, &m->attn_k[l], m->phb, T, m->pk, N, m->kv_dim, &P_pk) != 0) return -6;
             if (matvec_tile(m, &m->attn_v[l], m->phb, T, m->pv, N, m->kv_dim, &P_pv) != 0) return -6;
 
+            if (!m->is_qwen35) {
+                int bi;
+
+                for (bi = 0; bi < 3; ++bi) {
+                    nita_tensor_t *b;
+                    float         *dst;
+                    int            w;
+
+                    b   = bi == 0 ? &m->attn_q_bias[l] : bi == 1 ? &m->attn_k_bias[l] : &m->attn_v_bias[l];
+                    w   = bi == 0 ? qdim : m->kv_dim;
+                    dst = bi == 0 ? m->pq : bi == 1 ? m->pk : m->pv;
+                    if (!b->bound) continue;
+                    if (load_vector(b, m->biasbuf, w) != 0) return -6;
+                    for (i = 0; i < T; ++i)
+                        for (j = 0; j < w; ++j)
+                            dst[(size_t)i * (size_t)w + j] += m->biasbuf[j];
+                }
+            }
+
             for (i = 0; i < T; ++i) {
                 const int pos = pos0 + i;
                 double    _tr = prof_now();
@@ -3276,6 +3794,12 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
 
             attention_tile(m, l, pos0, T);
             if (matvec_tile(m, &m->attn_out[l], m->pa, T, m->ptmp, qdim, N, &P_po) != 0) return -8;
+            if (!m->is_qwen35 && m->attn_out_bias[l].bound) {
+                if (load_vector(&m->attn_out_bias[l], m->biasbuf, N) != 0) return -8;
+                for (i = 0; i < T; ++i)
+                    for (j = 0; j < N; ++j)
+                        m->ptmp[(size_t)i * (size_t)N + j] += m->biasbuf[j];
+            }
 
             for (i = 0; i < T; ++i)
                 for (j = 0; j < N; ++j)
@@ -3317,6 +3841,8 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
                 if (matvec(m, &m->out_proj, m->hb, logits, N, m->n_vocab, NULL) != 0) return -11;
                 prof_add(&P_out, prof_now() - _to, (long)m->n_vocab);
             }
+            if (m->out_bias_f32)
+                for (i = 0; i < m->n_vocab; ++i) logits[i] += m->out_bias_f32[i];
         }
     }
     return 0;
