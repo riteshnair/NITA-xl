@@ -41,11 +41,23 @@ def rope(vec, n_heads, head_dim, n_rot, pos, theta):
     return out
 
 
+DUMP = False
+
+def dump(name, v):
+    if not DUMP:
+        return
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    print('%s %d %s' % (name, v.size, ' '.join('%.6g' % x for x in v)))
+
 def main():
+    global DUMP
     ap = argparse.ArgumentParser()
     ap.add_argument('model')
     ap.add_argument('--tokens', required=True)
+    ap.add_argument('--dump', action='store_true',
+                    help='print intermediate tensors, one per line, for differential testing')
     args = ap.parse_args()
+    DUMP = args.dump
 
     ids = [int(t) for t in args.tokens.split(',') if t.strip()]
     g = GGUF(args.model)
@@ -83,13 +95,18 @@ def main():
 
     for pos, tok in enumerate(ids):
         x = m['tok'][tok].astype(np.float32).copy()
+        dump('embed', x)
         for l in range(n_layer):
             h = rmsnorm(x, m[(l, 'attn_norm')][0], eps)
+            dump('l%d.attn_in' % l, h)
             q = m[(l, 'attn_q')] @ h
             k = m[(l, 'attn_k')] @ h
             v = m[(l, 'attn_v')] @ h
             q = rope(q, n_head, head_dim, n_rot, pos, theta)
             k = rope(k, n_head_kv, head_dim, n_rot, pos, theta)
+            dump('l%d.q' % l, q)
+            dump('l%d.k' % l, k)
+            dump('l%d.v' % l, v)
             k_cache[l] = np.vstack([k_cache[l], k[None, :]])
             v_cache[l] = np.vstack([v_cache[l], v[None, :]])
 
@@ -106,14 +123,24 @@ def main():
                 probs = probs / np.sum(probs)
                 attn[hd * head_dim:(hd + 1) * head_dim] = probs @ vh
 
+            dump('l%d.abuf' % l, attn)
+            dump('l%d.attn_out' % l, m[(l, 'attn_output')] @ attn)
             x = x + m[(l, 'attn_output')] @ attn
+            dump('l%d.post_attn' % l, x)
             h2 = rmsnorm(x, m[(l, 'ffn_norm')][0], eps)
+            dump('l%d.ffn_in' % l, h2)
             gate = m[(l, 'ffn_gate')] @ h2
             up = m[(l, 'ffn_up')] @ h2
+            dump('l%d.gate' % l, gate)
+            dump('l%d.up' % l, up)
             ff = (gate / (1.0 + np.exp(-gate))) * up
+            dump('l%d.ff' % l, ff)
+            dump('l%d.ffn_out' % l, m[(l, 'ffn_down')] @ ff)
             x = x + m[(l, 'ffn_down')] @ ff
+            dump('l%d.out' % l, x)
 
         hout = rmsnorm(x, m['out_norm'], eps)
+        dump('final_norm', hout)
         logits = m['out'] @ hout
 
     print('tokens:', ' '.join(str(t) for t in ids))

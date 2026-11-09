@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 199309L   /* clock_gettime()/CLOCK_MONOTONIC on POSIX */
+
 /*
  * transformer.c – llama-style decoder forward pass.
  *
@@ -41,8 +43,9 @@
 
 /* ------------------------------------------------------------------ */
 /* Component profiler.                                                 */
-/* clock() costs ~100ns and there are ~70 calls per token, so the       */
-/* instrumentation overhead is far below measurement noise here.        */
+/* nita_prof_now() costs ~100ns (QPC / CLOCK_MONOTONIC) and there are   */
+/* ~70 calls per token, so the instrumentation overhead is far below   */
+/* measurement noise here.                                             */
 /* ------------------------------------------------------------------ */
 typedef struct { double us; long calls; } prof_t;
 
@@ -73,9 +76,15 @@ double nita_prof_now(void)
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart * 1e6 / (double)freq.QuadPart;
 #else
-    /* clock() is the portable fallback; it is coarse (1 ms on the Windows CRT),
-     * which is why the mixer phases used to read as whole milliseconds. */
-    return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;
+    /* clock() reports CPU time across all threads, not wall time, so a
+     * multithreaded run would read several times the actual latency and an
+     * idle-looking report would still show microseconds everywhere. Use the
+     * monotonic wall clock instead. */
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1000.0;
+    return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;   /* fallback */
 #endif
 }
 
@@ -2246,6 +2255,35 @@ FILE *nita_q35_dump_file(void)
     return f;
 }
 
+/* Same pattern for the llama path: NITA_DUMP=<file> dumps named intermediate
+ * tensors for differential testing. Each line is
+ *   <name> <count> <v0> <v1> ...
+ * matching tools/reference_logits.py --dump output byte-for-byte on values. */
+static FILE *nita_llama_dump_file(void)
+{
+    static FILE *f;
+
+    if (f) return f;
+    {
+        const char *p = getenv("NITA_DUMP");
+
+        if (!p || !*p) return NULL;
+        f = fopen(p, "w");
+    }
+    return f;
+}
+
+static void llama_dump(const char *name, const float *v, int n)
+{
+    FILE *f = nita_llama_dump_file();
+    int   i;
+
+    if (!f) return;
+    fprintf(f, "%s %d", name, n);
+    for (i = 0; i < n; ++i) fprintf(f, " %.6g", v[i]);
+    fputc('\n', f);
+}
+
 #define q35_dump nita_q35_dump_file
 
 static const float *q35_rot_in(nita_model_t *m, const nita_hadamard_t *xf,
@@ -2517,11 +2555,13 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
             return -4;
         prof_add(&P_embed, prof_now() - _te, 1);
     }
+    llama_dump("embed", m->xb, m->n_embd);
 
     for (l = 0; l < m->n_layer; ++l) {
         /* ---- attention block ---- */
         if (load_vector(&m->attn_norm[l], m->nbuf, m->n_embd) != 0) return -5;
         rmsnorm(m->hb, m->xb, m->nbuf, m->n_embd, m->rms_eps);
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.attn_in", l); llama_dump(nm, m->hb, m->n_embd); }
 
         if (matvec(m, &m->attn_q[l], m->hb, m->qbuf, m->n_embd, q_dim, &P_pq) != 0) return -6;
         if (matvec(m, &m->attn_k[l], m->hb, m->kbuf, m->n_embd, m->kv_dim, &P_pk) != 0) return -6;
@@ -2535,6 +2575,10 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
                        m->n_rot, pos, m->rope_theta);
             prof_add(&P_rope, prof_now() - _tr, 2);
         }
+        { char nm[32];
+          snprintf(nm, sizeof nm, "l%d.q", l); llama_dump(nm, m->qbuf, q_dim);
+          snprintf(nm, sizeof nm, "l%d.k", l); llama_dump(nm, m->kbuf, m->kv_dim);
+          snprintf(nm, sizeof nm, "l%d.v", l); llama_dump(nm, m->vbuf, m->kv_dim); }
 
         memcpy(m->k_cache[l] + (size_t)pos * (size_t)m->kv_dim,
                m->kbuf, (size_t)m->kv_dim * sizeof(float));
@@ -2542,37 +2586,48 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits)
                m->vbuf, (size_t)m->kv_dim * sizeof(float));
 
         if (attention(m, l, pos) != 0) return -7;
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.abuf", l); llama_dump(nm, m->abuf, q_dim); }
         if (matvec(m, &m->attn_out[l], m->abuf, m->tmp, q_dim, m->n_embd, &P_po) != 0) return -8;
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.attn_out", l); llama_dump(nm, m->tmp, m->n_embd); }
 
         {
             int i;
             for (i = 0; i < m->n_embd; ++i) m->xb[i] += m->tmp[i];
         }
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.post_attn", l); llama_dump(nm, m->xb, m->n_embd); }
 
         /* ---- feed-forward block (SwiGLU) ---- */
         if (load_vector(&m->ffn_norm[l], m->nbuf, m->n_embd) != 0) return -5;
         rmsnorm(m->hb, m->xb, m->nbuf, m->n_embd, m->rms_eps);
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.ffn_in", l); llama_dump(nm, m->hb, m->n_embd); }
 
         if (matvec(m, &m->ffn_gate[l], m->hb, m->gate, m->n_embd, m->n_ff, &P_pg) != 0) return -9;
         if (matvec(m, &m->ffn_up[l],   m->hb, m->up,   m->n_embd, m->n_ff, &P_pu) != 0) return -9;
+        { char nm[32];
+          snprintf(nm, sizeof nm, "l%d.gate", l); llama_dump(nm, m->gate, m->n_ff);
+          snprintf(nm, sizeof nm, "l%d.up", l); llama_dump(nm, m->up, m->n_ff); }
 
         {
             double _tf = prof_now();
             silu_mul(m->ff, m->gate, m->up, m->n_ff);
             prof_add(&P_ffnact, prof_now() - _tf, 1);
         }
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.ff", l); llama_dump(nm, m->ff, m->n_ff); }
 
         if (matvec(m, &m->ffn_down[l], m->ff, m->tmp, m->n_ff, m->n_embd, &P_pd) != 0) return -10;
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.ffn_out", l); llama_dump(nm, m->tmp, m->n_embd); }
 
         {
             int i;
             for (i = 0; i < m->n_embd; ++i) m->xb[i] += m->tmp[i];
         }
+        { char nm[32]; snprintf(nm, sizeof nm, "l%d.out", l); llama_dump(nm, m->xb, m->n_embd); }
     }
 
     /* Final norm and output projection */
     if (load_vector(&m->out_norm, m->nbuf, m->n_embd) != 0) return -5;
     rmsnorm(m->hb, m->xb, m->nbuf, m->n_embd, m->rms_eps);
+    llama_dump("final_norm", m->hb, m->n_embd);
 
     {
         double _to = prof_now();
