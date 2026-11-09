@@ -287,10 +287,18 @@ struct nita_model {
     float *pa;          /* attention output   [tile][q_dim]  */
     float *pk;          /* keys for the tile  [tile][kv_dim] */
     float *pv;          /* values for the tile[tile][kv_dim] */
-    float *pgate;       /* ffn gate           [tile][n_ff]   */
-    float *pup;         /* ffn up             [tile][n_ff]   */
-    float *pff;         /* ffn activated      [tile][n_ff]   */
+    float *pgate;       /* ffn gate           [tile][max(n_ff, n_ff_exp)] */
+    float *pup;         /* ffn up             [tile][max(n_ff, n_ff_exp)] */
+    float *pff;         /* ffn activated      [tile][max(n_ff, n_ff_exp, n_ff_shexp)] */
     float *pscores;     /* per-row attention scores [tile][ctx] */
+    /* MoE gather/scatter scratch (allocated only for MoE models). */
+    float *prouter;     /* [tile][n_expert] router logits, then probs */
+    float *pacc;        /* [tile][n_embd] weighted expert accumulation */
+    float *pgath;       /* [tile][n_embd] gathered rows for one expert */
+    int   *psel;        /* [tile][expert_used] selected expert ids     */
+    float *psw;         /* [tile][expert_used] gate weights             */
+    int   *prow_tok;    /* [tile] source token row, per gathered row    */
+    float *prow_w;      /* [tile] gate weight, per gathered row         */
 
     /* Row-parallel worker pool (NULL or 1 participant = serial). */
     void   *pool;
@@ -1563,6 +1571,67 @@ static int matvec_expert(nita_model_t *m, const nita_tensor_t *t, int e,
     v.data = t->data + (size_t)e * slice;
     v.ne2  = 1;
     return matvec(m, &v, x, y, expect_in, expect_out, slot);
+}
+
+/* Same for the tiled (batched-prefill) kernel: X holds ncol rows of
+ * expect_in floats, Y ncol rows of expect_out floats. */
+static int matvec_tile_expert(nita_model_t *m, const nita_tensor_t *t, int e,
+                              const float *X, int ncol, float *Y,
+                              int expect_in, int expect_out, prof_t *slot)
+{
+    nita_tensor_t v;
+    size_t        slice;
+
+    if (!bound_in_file(NULL, t)) return -1;
+    if ((int)t->ne0 != expect_in || (int)t->ne1 != expect_out) return -2;
+    if (ncol <= 0) return 0;
+
+    slice = (size_t)t->ne1 * nita_row_bytes(t->type, t->ne0);
+    v     = *t;
+    v.data = t->data + (size_t)e * slice;
+    v.ne2  = 1;
+    return matvec_tile(m, &v, X, ncol, Y, expect_in, expect_out, slot);
+}
+
+/* Top-k expert selection from a probs vector. Shared by the sequential and
+ * tiled MoE paths so they can never disagree about ties or ordering. */
+static void moe_topk(const float *probs, int E, int K,
+                     int *sel, float *sel_w, unsigned char *taken)
+{
+    int j, e;
+
+    memset(taken, 0, (size_t)E);
+    for (j = 0; j < K; ++j) {
+        int best = -1;
+
+        for (e = 0; e < E; ++e) {
+            if (taken[e]) continue;
+            if (best < 0 || probs[e] > probs[best]) best = e;
+        }
+        sel[j]  = best;
+        taken[best] = 1;
+        sel_w[j] = probs[best];
+    }
+}
+
+/* Expert-weight post-processing: renormalise when the arch calls for it
+ * (llama-arch MoE), then apply expert_weights_scale when it is set. */
+static void moe_weight_finish(nita_model_t *m, float *sel_w, int K)
+{
+    if (m->moe_norm_w) {
+        float s = 0.0f;
+        int   j;
+
+        for (j = 0; j < K; ++j) s += sel_w[j];
+        /* llama.cpp clamps the divisor to the smallest F16 normal. */
+        if (s < 6.103515625e-5f) s = 6.103515625e-5f;
+        for (j = 0; j < K; ++j) sel_w[j] /= s;
+    }
+    if (m->exp_w_scale != 0.0f && m->exp_w_scale != 1.0f) {
+        int j;
+
+        for (j = 0; j < K; ++j) sel_w[j] *= m->exp_w_scale;
+    }
 }
 
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps)
@@ -2864,35 +2933,14 @@ int nita_model_n_vocab(const nita_model_t *m)  { return m ? m->n_vocab : 0; }
 static int moe_ffn(nita_model_t *m, int l)
 {
     const int E = m->n_expert, K = m->expert_used;
-    int       e, j, c;
+    int       j, c;
 
     if (matvec(m, &m->ffn_gate_inp[l], m->hb, m->router, m->n_embd, E, NULL) != 0)
         return -1;
     softmax_inplace(m->router, E);
 
-    memset(m->sel_taken, 0, (size_t)E);
-    for (j = 0; j < K; ++j) {
-        int best = -1;
-
-        for (e = 0; e < E; ++e) {
-            if (m->sel_taken[e]) continue;
-            if (best < 0 || m->router[e] > m->router[best]) best = e;
-        }
-        m->sel[j]           = best;
-        m->sel_taken[best]  = 1;
-        m->sel_w[j]         = m->router[best];
-    }
-    if (m->moe_norm_w) {
-        float s = 0.0f;
-
-        for (j = 0; j < K; ++j) s += m->sel_w[j];
-        /* llama.cpp clamps the divisor to the smallest F16 normal to avoid
-         * a zero-sum blow-up. */
-        if (s < 6.103515625e-5f) s = 6.103515625e-5f;
-        for (j = 0; j < K; ++j) m->sel_w[j] /= s;
-    }
-    if (m->exp_w_scale != 0.0f && m->exp_w_scale != 1.0f)
-        for (j = 0; j < K; ++j) m->sel_w[j] *= m->exp_w_scale;
+    moe_topk(m->router, E, K, m->sel, m->sel_w, m->sel_taken);
+    moe_weight_finish(m, m->sel_w, K);
 
     memset(m->acc, 0, (size_t)m->n_embd * sizeof *m->acc);
     for (j = 0; j < K; ++j) {
@@ -2924,6 +2972,105 @@ static int moe_ffn(nita_model_t *m, int l)
         silu_mul(m->ff, m->gate, m->up, ffw);
         if (matvec(m, &m->shexp_down[l], m->ff, m->tmp, ffw, m->n_embd, &P_pd) != 0) return -3;
         for (c = 0; c < m->n_embd; ++c) m->acc[c] += s * m->tmp[c];
+    }
+    return 0;
+}
+
+/* Tiled MoE feed-forward for the T tokens in m->phb. Router runs once for
+ * the whole tile, then each expert sees only the rows that selected it
+ * (gather/scatter by top-k), so sparse routing actually saves work. Writes
+ * the weighted expert sum into m->pacc; the caller adds it to the residual.
+ * Note: pacc is accumulated expert-by-expert (ascending expert id), which is
+ * not the per-token selection order of the sequential path - the projection
+ * sums themselves are still exact, so this differs only by float reordering,
+ * like the vectorised tile attention. */
+static int moe_tile_ffn(nita_model_t *m, int l, int T)
+{
+    const int E = m->n_expert, K = m->expert_used, N = m->n_embd;
+    const int ffw = m->n_ff_exp;
+    int       e, i, j, c, r;
+
+    if (matvec_tile(m, &m->ffn_gate_inp[l], m->phb, T, m->prouter, N, E, NULL) != 0)
+        return -1;
+    for (i = 0; i < T; ++i)
+        softmax_inplace(m->prouter + (size_t)i * (size_t)E, E);
+
+    memset(m->pacc, 0, (size_t)T * (size_t)N * sizeof(float));
+    for (i = 0; i < T; ++i) {
+        float *probs = m->prouter + (size_t)i * (size_t)E;
+
+        moe_topk(probs, E, K, m->psel + (size_t)i * (size_t)K,
+                 m->psw + (size_t)i * (size_t)K, m->sel_taken);
+        moe_weight_finish(m, m->psw + (size_t)i * (size_t)K, K);
+    }
+
+    for (e = 0; e < E; ++e) {
+        int cnt = 0;
+
+        for (i = 0; i < T; ++i)
+            for (j = 0; j < K; ++j)
+                if (m->psel[(size_t)i * (size_t)K + (size_t)j] == e) {
+                    memcpy(m->pgath + (size_t)cnt * (size_t)N,
+                           m->phb + (size_t)i * (size_t)N,
+                           (size_t)N * sizeof(float));
+                    m->prow_tok[cnt] = i;
+                    m->prow_w[cnt]   = m->psw[(size_t)i * (size_t)K + (size_t)j];
+                    ++cnt;
+                }
+        if (cnt == 0) continue;
+
+        if (matvec_tile_expert(m, &m->ffn_gate_exps[l], e, m->pgath, cnt,
+                               m->pgate, N, ffw, &P_pg) != 0) return -2;
+        if (matvec_tile_expert(m, &m->ffn_up_exps[l],   e, m->pgath, cnt,
+                               m->pup, N, ffw, &P_pu) != 0) return -2;
+        {
+            double _tf = prof_now();
+
+            for (i = 0; i < cnt; ++i)
+                silu_mul(m->pff + (size_t)i * (size_t)ffw,
+                         m->pgate + (size_t)i * (size_t)ffw,
+                         m->pup + (size_t)i * (size_t)ffw, ffw);
+            prof_add(&P_ffnact, prof_now() - _tf, (long)cnt);
+        }
+        if (matvec_tile_expert(m, &m->ffn_down_exps[l], e, m->pff, cnt,
+                               m->ptmp, ffw, N, &P_pd) != 0) return -2;
+        for (r = 0; r < cnt; ++r) {
+            const int   tok = m->prow_tok[r];
+            const float w   = m->prow_w[r];
+
+            for (c = 0; c < N; ++c)
+                m->pacc[(size_t)tok * (size_t)N + (size_t)c] +=
+                    w * m->ptmp[(size_t)r * (size_t)N + (size_t)c];
+        }
+    }
+
+    /* sigmoid-gated shared expert: dense over the tile, one matvec each */
+    if (m->n_ff_shexp > 0) {
+        const int fs = m->n_ff_shexp;
+
+        if (load_vector(&m->shexp_gate_inp[l], m->biasbuf, N) != 0) return -3;
+        if (matvec_tile(m, &m->shexp_gate[l], m->phb, T, m->pgate, N, fs, &P_pg) != 0) return -3;
+        if (matvec_tile(m, &m->shexp_up[l],   m->phb, T, m->pup,   N, fs, &P_pu) != 0) return -3;
+        {
+            double _tf = prof_now();
+
+            for (i = 0; i < T; ++i)
+                silu_mul(m->pff + (size_t)i * (size_t)fs,
+                         m->pgate + (size_t)i * (size_t)fs,
+                         m->pup + (size_t)i * (size_t)fs, fs);
+            prof_add(&P_ffnact, prof_now() - _tf, (long)T);
+        }
+        if (matvec_tile(m, &m->shexp_down[l], m->pff, T, m->ptmp, fs, N, &P_pd) != 0) return -3;
+        for (i = 0; i < T; ++i) {
+            float s = 0.0f;
+
+            for (c = 0; c < N; ++c)
+                s += m->phb[(size_t)i * (size_t)N + (size_t)c] * m->biasbuf[c];
+            s = 1.0f / (1.0f + expf(-s));
+            for (c = 0; c < N; ++c)
+                m->pacc[(size_t)i * (size_t)N + (size_t)c] +=
+                    s * m->ptmp[(size_t)i * (size_t)N + (size_t)c];
+        }
     }
     return 0;
 }
@@ -3413,6 +3560,13 @@ static void prefill_free(nita_model_t *m)
     free(m->pup);    m->pup    = NULL;
     free(m->pff);    m->pff    = NULL;
     free(m->pscores); m->pscores = NULL;
+    free(m->prouter);  m->prouter  = NULL;
+    free(m->pacc);     m->pacc     = NULL;
+    free(m->pgath);    m->pgath    = NULL;
+    free(m->psel);     m->psel     = NULL;
+    free(m->psw);      m->psw      = NULL;
+    free(m->prow_tok); m->prow_tok = NULL;
+    free(m->prow_w);   m->prow_w   = NULL;
     m->tile = 0;
 }
 
@@ -3442,6 +3596,10 @@ static int prefill_alloc(nita_model_t *m)
 
     q_dim = m->n_head * m->head_dim;
 
+    int ffs = m->n_ff;
+    if (m->n_ff_exp > ffs)   ffs = m->n_ff_exp;
+    if (m->n_ff_shexp > ffs) ffs = m->n_ff_shexp;
+
     m->pxb     = (float *)nita_calloc((size_t)t * (size_t)m->n_embd, sizeof(float));
     m->phb     = (float *)nita_calloc((size_t)t * (size_t)m->n_embd, sizeof(float));
     m->ptmp    = (float *)nita_calloc((size_t)t * (size_t)m->n_embd, sizeof(float));
@@ -3449,10 +3607,28 @@ static int prefill_alloc(nita_model_t *m)
     m->pa      = (float *)nita_calloc((size_t)t * (size_t)q_dim, sizeof(float));
     m->pk      = (float *)nita_calloc((size_t)t * (size_t)m->kv_dim, sizeof(float));
     m->pv      = (float *)nita_calloc((size_t)t * (size_t)m->kv_dim, sizeof(float));
-    m->pgate   = (float *)nita_calloc((size_t)t * (size_t)m->n_ff, sizeof(float));
-    m->pup     = (float *)nita_calloc((size_t)t * (size_t)m->n_ff, sizeof(float));
-    m->pff     = (float *)nita_calloc((size_t)t * (size_t)m->n_ff, sizeof(float));
+    m->pgate   = (float *)nita_calloc((size_t)t * (size_t)ffs, sizeof(float));
+    m->pup     = (float *)nita_calloc((size_t)t * (size_t)ffs, sizeof(float));
+    m->pff     = (float *)nita_calloc((size_t)t * (size_t)ffs, sizeof(float));
     m->pscores = (float *)nita_calloc((size_t)t * (size_t)m->ctx, sizeof(float));
+
+    if (m->is_moe) {
+        const int E = m->n_expert, K = m->expert_used;
+
+        m->prouter  = (float *)nita_calloc((size_t)t * (size_t)E, sizeof(float));
+        m->pacc     = (float *)nita_calloc((size_t)t * (size_t)m->n_embd, sizeof(float));
+        m->pgath    = (float *)nita_calloc((size_t)t * (size_t)m->n_embd, sizeof(float));
+        m->psel     = (int *)nita_calloc((size_t)t * (size_t)K, sizeof(int));
+        m->psw      = (float *)nita_calloc((size_t)t * (size_t)K, sizeof(float));
+        m->prow_tok = (int *)nita_calloc((size_t)t, sizeof(int));
+        m->prow_w   = (float *)nita_calloc((size_t)t, sizeof(float));
+        if (!m->prouter || !m->pacc || !m->pgath || !m->psel || !m->psw ||
+            !m->prow_tok || !m->prow_w) {
+            prefill_free(m);
+            m->tile = -1;
+            return -1;
+        }
+    }
 
     if (!m->pxb || !m->phb || !m->ptmp || !m->pq || !m->pa || !m->pk ||
         !m->pv || !m->pgate || !m->pup || !m->pff || !m->pscores) {
@@ -3693,10 +3869,9 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
     const char *seq;
     int         start, i, l, j;
 
-    if (m && (m->is_qwen35 || m->is_moe)) {
-        /* The expert graph and the hybrid graph decode a token at a time;
-         * prefill by looping so generation works end to end. Only the last
-         * logits are wanted. */
+    if (m && m->is_qwen35) {
+        /* The hybrid graph decodes a token at a time; prefill by looping so
+         * generation works end to end. Only the last logits are wanted. */
         for (i = 0; i < n; ++i)
             if (nita_forward(m, ids[i], logits) != 0) return -1;
         return 0;
@@ -3805,11 +3980,20 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
                 for (j = 0; j < N; ++j)
                     m->pxb[(size_t)i * (size_t)N + j] += m->ptmp[(size_t)i * (size_t)N + j];
 
-            /* ---- feed-forward block (SwiGLU) ---- */
+            /* ---- feed-forward block (SwiGLU, or experts) ---- */
             if (load_vector(&m->ffn_norm[l], m->nbuf, N) != 0) return -5;
             for (i = 0; i < T; ++i)
                 rmsnorm(m->phb + (size_t)i * (size_t)N,
                         m->pxb + (size_t)i * (size_t)N, m->nbuf, N, m->rms_eps);
+
+            if (m->is_moe) {
+                if (moe_tile_ffn(m, l, T) != 0) return -12;
+                for (i = 0; i < T; ++i)
+                    for (j = 0; j < N; ++j)
+                        m->pxb[(size_t)i * (size_t)N + j] +=
+                            m->pacc[(size_t)i * (size_t)N + j];
+                goto layer_done;
+            }
 
             if (matvec_tile(m, &m->ffn_gate[l], m->phb, T, m->pgate, N, m->n_ff, &P_pg) != 0) return -9;
             if (matvec_tile(m, &m->ffn_up[l],   m->phb, T, m->pup,   N, m->n_ff, &P_pu) != 0) return -9;
@@ -3827,6 +4011,9 @@ int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits)
             for (i = 0; i < T; ++i)
                 for (j = 0; j < N; ++j)
                     m->pxb[(size_t)i * (size_t)N + j] += m->ptmp[(size_t)i * (size_t)N + j];
+
+layer_done:
+            (void)0;
         }
 
         m->pos = pos0 + T;
