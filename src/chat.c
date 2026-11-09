@@ -60,7 +60,8 @@ static const char *role_name(chat_role_t r)
     }
 }
 
-char *chat_render_prompt(const gguf_file_t *g, const chat_history_t *h)
+char *chat_render_prompt(const gguf_file_t *g, const tokenizer_t *tok,
+                         const chat_history_t *h)
 {
     nbuf_t b;
     size_t i;
@@ -68,16 +69,35 @@ char *chat_render_prompt(const gguf_file_t *g, const chat_history_t *h)
 
     nbuf_init(&b);
 
-    if (g && gguf_has_key(g, "tokenizer.chat_template")) {
-        BREADCRUMB("chat", "model supplies a Jinja chat template; using ChatML fallback");
-    }
+    /* A model only speaks ChatML when the checkpoint ships a chat template
+     * or its vocabulary actually contains the ChatML control tokens.
+     * Wrapping a base model that lacks them (stories/TinyLlama class) turns
+     * the prompt into <unk> byte-soup and the model answers garbage — which
+     * is indistinguishable from a broken forward pass. In that case render a
+     * plain completion prompt instead: raw text, no synthetic special tokens. */
+    {
+        bool has_template = g && gguf_has_key(g, "tokenizer.chat_template");
+        bool speaks_chatml = tok &&
+            tokenizer_find(tok, "<|im_start|>") >= 0 &&
+            tokenizer_find(tok, "<|im_end|>") >= 0;
 
-    for (i = 0; i < h->count; ++i) {
-        nbuf_printf(&b, "<|im_start|>%s\n", role_name(h->messages[i].role));
-        nbuf_puts(&b, h->messages[i].content ? h->messages[i].content : "");
-        nbuf_puts(&b, "<|im_end|>\n");
+        if (has_template || speaks_chatml) {
+            if (has_template)
+                BREADCRUMB("chat", "model supplies a Jinja chat template; using ChatML fallback");
+            for (i = 0; i < h->count; ++i) {
+                nbuf_printf(&b, "<|im_start|>%s\n", role_name(h->messages[i].role));
+                nbuf_puts(&b, h->messages[i].content ? h->messages[i].content : "");
+                nbuf_puts(&b, "<|im_end|>\n");
+            }
+            nbuf_puts(&b, "<|im_start|>assistant\n");
+        } else {
+            BREADCRUMB("chat", "no chat template and no ChatML tokens in vocabulary; using plain completion prompt");
+            for (i = 0; i < h->count; ++i) {
+                if (i > 0) nbuf_putc(&b, '\n');
+                nbuf_puts(&b, h->messages[i].content ? h->messages[i].content : "");
+            }
+        }
     }
-    nbuf_puts(&b, "<|im_start|>assistant\n");
 
     out = nita_strdup(nbuf_cstr(&b));
     nbuf_free(&b);
@@ -188,7 +208,7 @@ int chat_complete(const gguf_file_t *g, const tokenizer_t *tok,
 
     if (max_tokens <= 0) max_tokens = 256;
 
-    prompt = h ? chat_render_prompt(g, h) : nita_strdup("");
+    prompt = h ? chat_render_prompt(g, tok, h) : nita_strdup("");
 
     if (tok && tok->has_vocab)
         ids = tokenizer_encode(tok, prompt, &n_ids);
