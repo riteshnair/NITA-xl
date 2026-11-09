@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "hadamard.h"
 
@@ -380,10 +381,37 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits);
  * next-token distribution for the last token of the run. */
 int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits);
 
-/* Component profiler (transformer.c). Compiles only with -DSHERLOCK_LITE:
- * with the flag off every probe site folds to nothing and the binary
- * carries zero instrumentation, so a plain benchmark cannot be skewed by
- * the probe itself. Reset before a measured window and dump afterwards;
+/* Runtime trace switch, cached on first call: NITA_TRACE=1 turns the probes
+ * on for this run, NITA_TRACE=0 turns a -DSHERLOCK_LITE build's off. With
+ * the env unset, only a SHERLOCK_LITE build probes. The disabled probe is one
+ * predictable not-taken branch - no clock reads, no counter updates, nothing
+ * printed. */
+static inline int nita_trace_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("NITA_TRACE");
+        if (!e || !*e)      mode = 0;                       /* unset   */
+        else                mode = (*e == '0') ? 2 : 1;      /* 2 off / 1 on */
+    }
+    return mode;
+}
+
+static inline int nita_trace_enabled(void)
+{
+    int m = nita_trace_mode();
+    if (m == 1) return 1;
+    if (m == 2) return 0;
+#if defined(SHERLOCK_LITE)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* Component profiler (transformer.c). On for a run when NITA_TRACE=1, or
+ * always in a -DSHERLOCK_LITE build; otherwise the probes do no work and
+ * nothing is printed. Reset before a measured window and dump afterwards;
  * both write to stdout. */
 void nita_prof_reset(void);
 void nita_prof_dump(void);
@@ -392,7 +420,7 @@ void nita_prof_dump(void);
  * can repeat a measurement and report the median of each component instead of
  * trusting whichever single run it happened to get. "out-proj" is a subset of
  * "projections", so a total must skip rows with subset set. */
-#define NITA_PROF_MAX_ROWS 24
+#define NITA_PROF_MAX_ROWS 48
 
 typedef struct {
     const char *name;

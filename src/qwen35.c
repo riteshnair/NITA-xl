@@ -401,16 +401,10 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
     if (!s || !s->buf) return -1;
 
-#if defined(SHERLOCK_LITE)
-#  define Q35_CLOCK() nita_prof_now()
-#  define Q35_PHASE(part, t0) nita_prof_mix((part), Q35_CLOCK() - (t0))
-#else
-/* With the flag off the probes fold to nothing, so a default build carries
- * zero instrumentation (and cannot report a probe-skewed delta). The no-op
- * consumes t0 so -Wunused-variable stays quiet. */
-#  define Q35_CLOCK() 0.0
-#  define Q35_PHASE(part, t0) ((void)(t0))
-#endif
+/* Runtime-gated: the disabled probe is one predictable not-taken branch,
+ * so a plain run measures the mixer, not the probe. */
+#define Q35_CLOCK() (nita_trace_enabled() ? nita_prof_now() : 0.0)
+#define Q35_PHASE(part, t0) do { if (nita_trace_enabled()) nita_prof_mix((part), nita_prof_now() - (t0)); } while (0)
     {
         double t0 = Q35_CLOCK();
 

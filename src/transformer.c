@@ -53,11 +53,13 @@ typedef long LONG;
 
 /* ------------------------------------------------------------------ */
 /* Component profiler.                                                 */
-/* Compiles only with SHERLOCK_LITE. With the flag off prof_now/prof_add */
-/* are empty inline functions, so every probe site folds to nothing and  */
-/* a plain benchmark measures the engine, never the probe. nita_prof_now() */
-/* costs ~100ns (QPC / CLOCK_MONOTONIC) per call, so even the lit build  */
-/* carries ~70 probes per token.                                        */
+/* On for a run when NITA_TRACE=1 in the environment, or always in a     */
+/* -DSHERLOCK_LITE build (NITA_TRACE=0 forces a lit build off). With the */
+/* trace disabled the probes are one predictable not-taken branch - no   */
+/* clock read, no counter update, nothing printed - so a plain benchmark */
+/* measures the engine, not the probe. nita_prof_now() costs ~100ns      */
+/* (QPC / CLOCK_MONOTONIC) per call, so even the lit build carries       */
+/* ~70 probes per token.                                                */
 /* ------------------------------------------------------------------ */
 typedef struct { double us; long calls; } prof_t;
 
@@ -77,8 +79,13 @@ static prof_t P_norm;    /* rmsnorm bodies                             */
 static prof_t P_embed;   /* token embedding dequant                    */
 static prof_t P_ffnact;  /* silu * up                                  */
 static prof_t P_rope;
+static prof_t P_aq8;        /* aq8 activation quantise, paid before     */
+                            /* the mv bracket - not a subset of P_proj  */
+static prof_t P_kq4K, P_kq5K, P_kq6K, P_q50, P_q51, P_q80, P_iq4nl, P_kother;
+                            /* per-kernel scratch: which quant type ate  */
+                            /* the projections bracket (subsets of        */
+                            /* P_proj)                                   */
 
-#if defined(SHERLOCK_LITE)
 double nita_prof_now(void)
 {
 #if defined(_WIN32)
@@ -100,47 +107,49 @@ double nita_prof_now(void)
     return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;   /* fallback */
 #endif
 }
-#else
-double nita_prof_now(void)
-{
-    return 0.0;
-}
-#endif
 
-#if defined(SHERLOCK_LITE)
 static double prof_now(void)
 {
-    return nita_prof_now();
+    /* The disabled probe is one predictable not-taken branch. */
+    return nita_trace_enabled() ? nita_prof_now() : 0.0;
 }
 
 static void prof_add(prof_t *p, double dt, long calls)
 {
+    if (!nita_trace_enabled()) return;
     p->us += dt;
     p->calls += calls;
 }
-#else
-/* Empty by design: the call folds to zero instructions, so the probe
- * sites cost nothing in a default build. */
-static inline double prof_now(void)             { return 0.0; }
-static inline void   prof_add(prof_t *p, double dt, long calls)
+
+/* Attribute one projection bracket to the quantisation kernel inside it,
+ * so a trace can name which kernel ate the time. */
+static void prof_kernel(uint32_t type, double dt)
 {
-    (void)p; (void)dt; (void)calls;
+    switch (type) {
+    case 6:  prof_add(&P_q50,  dt, 1); break;
+    case 7:  prof_add(&P_q51,  dt, 1); break;
+    case 8:  prof_add(&P_q80,  dt, 1); break;
+    case 12: prof_add(&P_kq4K, dt, 1); break;
+    case 13: prof_add(&P_kq5K, dt, 1); break;
+    case 14: prof_add(&P_kq6K, dt, 1); break;
+    case 20: prof_add(&P_iq4nl, dt, 1); break;
+    default: prof_add(&P_kother, dt, 1); break;
+    }
 }
-#endif
 
 void nita_prof_mix(int part, double us)
 {
-#if defined(SHERLOCK_LITE)
     if (part < 0 || part >= NITA_MIX_PARTS) return;
     prof_add(&P_mixp[part], us, 1);
-#else
-    (void)part; (void)us;
-#endif
 }
 
 void nita_prof_reset(void)
 {
-#if defined(SHERLOCK_LITE)
+    memset(&P_aq8, 0, sizeof P_aq8);
+    memset(&P_kq4K, 0, sizeof P_kq4K);   memset(&P_kq5K, 0, sizeof P_kq5K);
+    memset(&P_kq6K, 0, sizeof P_kq6K);   memset(&P_q50,  0, sizeof P_q50);
+    memset(&P_q51,  0, sizeof P_q51);    memset(&P_q80,  0, sizeof P_q80);
+    memset(&P_iq4nl, 0, sizeof P_iq4nl); memset(&P_kother, 0, sizeof P_kother);
     memset(&P_proj, 0, sizeof P_proj);   memset(&P_out, 0, sizeof P_out);
     memset(&P_pq, 0, sizeof P_pq);  memset(&P_pk, 0, sizeof P_pk);
     memset(&P_pv, 0, sizeof P_pv);  memset(&P_po, 0, sizeof P_po);
@@ -151,7 +160,6 @@ void nita_prof_reset(void)
     memset(&P_norm, 0, sizeof P_norm);
     memset(&P_embed, 0, sizeof P_embed); memset(&P_ffnact, 0, sizeof P_ffnact);
     memset(&P_rope, 0, sizeof P_rope);
-#endif
 }
 
 int nita_prof_rows(nita_prof_row_t *out, int max_rows)
@@ -161,24 +169,29 @@ int nita_prof_rows(nita_prof_row_t *out, int max_rows)
                                     "  q-proj", "  k-proj", "  v-proj", "  o-proj",
                                     "  ffn-gate", "  ffn-up", "  ffn-down",
                                     "  mix norm+qkv", "  mix conv", "  mix gates",
-                                    "  mix delta", "  mix gated-norm", "  mix out-proj" };
+                                    "  mix delta", "  mix gated-norm", "  mix out-proj",
+                                    "aq8-quantise",
+                                    "  kernel:q4_K", "  kernel:q5_K", "  kernel:q6_K",
+                                    "  kernel:q5_0", "  kernel:q5_1", "  kernel:q8_0",
+                                    "  kernel:iq4_nl", "  kernel:other" };
     static const int   subset[] = { 0, 1, 0, 0, 0, 0, 0, 0,
                                     1, 1, 1, 1, 1, 1, 1,
-                                    1, 1, 1, 1, 1, 1 };
+                                    1, 1, 1, 1, 1, 1,
+                                    0,
+                                    1, 1, 1, 1, 1, 1, 1, 1 };
     const prof_t      *src[]    = { &P_proj, &P_out, &P_attn, &P_mix,
                                     &P_norm, &P_ffnact, &P_rope, &P_embed,
                                     &P_pq, &P_pk, &P_pv, &P_po,
                                     &P_pg, &P_pu, &P_pd,
                                     &P_mixp[0], &P_mixp[1], &P_mixp[2],
-                                    &P_mixp[3], &P_mixp[4], &P_mixp[5] };
+                                    &P_mixp[3], &P_mixp[4], &P_mixp[5],
+                                    &P_aq8,
+                                    &P_kq4K, &P_kq5K, &P_kq6K,
+                                    &P_q50, &P_q51, &P_q80,
+                                    &P_iq4nl, &P_kother };
     const int          n = (int)(sizeof src / sizeof src[0]);
     int                i;
 
-#if !defined(SHERLOCK_LITE)
-    (void)names; (void)subset; (void)src; (void)n;
-    (void)out; (void)max_rows; (void)i;
-    return 0;
-#else
     if (!out || max_rows <= 0) return 0;
     for (i = 0; i < n && i < max_rows; ++i) {
         out[i].name   = names[i];
@@ -187,12 +200,10 @@ int nita_prof_rows(nita_prof_row_t *out, int max_rows)
         out[i].subset = subset[i];
     }
     return i;
-#endif
 }
 
 void nita_prof_dump(void)
 {
-#if defined(SHERLOCK_LITE)
     nita_prof_row_t rows[NITA_PROF_MAX_ROWS];
     int             n = nita_prof_rows(rows, NITA_PROF_MAX_ROWS);
     double          tot = 0.0;
@@ -211,7 +222,6 @@ void nita_prof_dump(void)
     }
     printf("%-16s%8s%14.1f\n", "sum", "", tot);
     fflush(stdout);
-#endif
 }
 
 /* Which of a qwen35 block's matmuls consume a rotated activation. NULL when
@@ -1496,7 +1506,10 @@ static int matvec(nita_model_t *m, const nita_tensor_t *t,
         nita_aq8_t *aq = aq_scratch(m, (size_t)nb);
 
         if (aq) {
+            double _t0 = prof_now();
+
             nita_aq8_quantise(x, (int)t->ne0, aq);
+            prof_add(&P_aq8, prof_now() - _t0, 1);
             job.aq        = aq;
             job.aq_stride = nb;
         }
@@ -1521,6 +1534,7 @@ static int matvec(nita_model_t *m, const nita_tensor_t *t,
         dt = prof_now() - _t0;
         prof_add(&P_proj, dt, (long)t->ne1);
         if (slot) prof_add(slot, dt, 1);
+        prof_kernel(t->type, dt);
     }
     return 0;
 }
@@ -1544,11 +1558,13 @@ static int matvec_tile(nita_model_t *m, const nita_tensor_t *t,
         nita_aq8_t *aq = aq_scratch(m, (size_t)nb * (size_t)ncol);
 
         if (aq) {
-            int i;
+            double _t0 = prof_now();
+            int    i;
 
             for (i = 0; i < ncol; ++i)
                 nita_aq8_quantise(X + (size_t)i * (size_t)expect_in, (int)t->ne0,
                                   aq + (size_t)i * (size_t)nb);
+            prof_add(&P_aq8, prof_now() - _t0, (long)ncol);
             job.aq        = aq;
             job.aq_stride = nb;
         }
@@ -1574,6 +1590,7 @@ static int matvec_tile(nita_model_t *m, const nita_tensor_t *t,
         dt = prof_now() - _t0;
         prof_add(&P_proj, dt, (long)t->ne1 * (long)ncol);
         if (slot) prof_add(slot, dt, 1);
+        prof_kernel(t->type, dt);
     }
     return 0;
 }

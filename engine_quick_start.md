@@ -58,7 +58,7 @@ token-incremental).
 | `-DNITA_TEST_MODELS` | CMake | checkpoint(s) for the checkpoint test entries |
 | `-DNITA_TEST_SLOW=ON` | CMake | register fork_match on checkpoints >1 GiB |
 | `-DDEBUG_BREADCRUMBS=ON` | CMake | stderr breadcrumb trace (see sherlock_spec.md) |
-| `-DSHERLOCK_LITE=ON` | CMake | tag lines + component timing table on stdout (zero probe code when off) |
+| `-DSHERLOCK_LITE=ON` | CMake | component timing table on stdout; `NITA_TRACE=1` for the runtime tag-only trace |
 
 The CMake quantisation options (`-DTERNARY`, `-DGPTQ`, `-DAWQ`, …) only set a
 **label** reported by `--version` and the served `system_fingerprint`; they do
