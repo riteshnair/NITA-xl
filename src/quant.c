@@ -15,6 +15,7 @@
  */
 #include "quant.h"
 #include "nita.h"
+#include "iq_tables.h"
 
 #include <math.h>
 #include <string.h>
@@ -95,6 +96,17 @@ void nita_aq8_quantise(const float *x, int k, nita_aq8_t *out)
 #endif
         }
         for (i = 0; i < 32; ++i) sum += o->qs[i];
+        {
+            int g;
+
+            for (g = 0; g < 4; ++g) {
+                int32_t gsum = (int32_t)o->qs[g * 8 + 0] + o->qs[g * 8 + 1]
+                             + o->qs[g * 8 + 2] + o->qs[g * 8 + 3]
+                             + o->qs[g * 8 + 4] + o->qs[g * 8 + 5]
+                             + o->qs[g * 8 + 6] + o->qs[g * 8 + 7];
+                o->sums[g] = gsum;
+            }
+        }
         o->d   = d;
         o->sum = sum;
     }
@@ -274,32 +286,27 @@ static float dot_q8_0(const uint8_t *row, const nita_aq8_t *a, int nb)
 }
 
 /* ------------------------------------------------------------------ */
-/* Q4_K: 256 weights, 8 sub-blocks of 32, 144 bytes                   */
+/* Q4_K: 256 weights, 144 bytes                                       */
 /*   d +0, dmin +2, 12 scale bytes +4, qs +16                         */
-/*   sub-block j: qs[j*16 + l] low nibble -> element j*32 + l         */
-/*                qs[j*16 + l] high nibble -> element j*32 + 16 + l   */
-/*   value = d*sc[j]*w - dmin*m[j]                                    */
+/*   chunk j (0..3), 64 elements: low nibbles of 32 bytes qs[j*32..]   */
+/*              -> elements j*64 .. j*64+32, scale sc[2j], min mn[2j]  */
+/*   high nibbles of the same bytes -> j*64+32 .. j*64+64,             */
+/*              scale sc[2j+1], min mn[2j+1]                           */
+/*   value = d*sc*w - dmin*mn                                          */
 /* ------------------------------------------------------------------ */
 static void q4k_scales(const uint8_t *s, int8_t sc[8], int8_t mn[8])
 {
-    uint32_t aux[4], tmp;
-    const uint32_t kmask1 = 0x3f3f3f3fu, kmask2 = 0x0f0f0f0fu;
-    int i;
+    int j;
 
-    for (i = 0; i < 3; ++i)
-        aux[i] = (uint32_t)s[i * 4 + 0] | ((uint32_t)s[i * 4 + 1] << 8)
-               | ((uint32_t)s[i * 4 + 2] << 16) | ((uint32_t)s[i * 4 + 3] << 24);
-
-    tmp    = aux[2];
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp) & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-
-    for (i = 0; i < 8; ++i) sc[i] = (int8_t)((aux[i / 4] >> (8 * (i % 4))) & 0xFF);
-    for (i = 0; i < 8; ++i) mn[i] = (int8_t)((aux[2 + i / 4] >> (8 * (i % 4))) & 0xFF);
+    for (j = 0; j < 4; ++j) {
+        sc[j] = (int8_t)(s[j] & 63);
+        mn[j] = (int8_t)(s[j + 4] & 63);
+    }
+    for (j = 4; j < 8; ++j) {
+        sc[j] = (int8_t)((s[j + 4] & 0x0F) | ((s[j - 4] >> 6) << 4));
+        mn[j] = (int8_t)((s[j + 4] >> 4) | ((s[j] >> 6) << 4));
+    }
 }
-
 static float dot_q4_K(const uint8_t *row, const nita_aq8_t *a, int nb)
 {
     float acc = 0.0f, msum = 0.0f;
@@ -319,17 +326,20 @@ static float dot_q4_K(const uint8_t *row, const nita_aq8_t *a, int nb)
 
             q4k_scales(blk + 4, sc, mn);
 
-            for (j = 0; j < 8; ++j) {
-                const nita_aq8_t *ab = &a[sb * 8 + j];
-                const __m128i b128 = _mm_loadu_si128((const __m128i *)(qs + j * 16));
-                const __m128i m0f  = _mm_set1_epi8(0x0F);
-                const __m256i w8   = _mm256_set_m128i(
-                                         _mm_and_si128(_mm_srli_epi16(b128, 4), m0f),
-                                         _mm_and_si128(b128, m0f));
+            for (j = 0; j < 4; ++j) {
+                const nita_aq8_t *ab0 = &a[sb * 8 + 2 * j];
+                const nita_aq8_t *ab1 = &a[sb * 8 + 2 * j + 1];
+                const __m256i q256 = _mm256_loadu_si256((const __m256i *)(qs + j * 32));
+                const __m256i m0f  = _mm256_set1_epi8(0x0F);
+                const __m256i wlo  = _mm256_and_si256(q256, m0f);
+                const __m256i whi  = _mm256_and_si256(_mm256_srli_epi16(q256, 4), m0f);
 
-                vacc = _mm256_fmadd_ps(dot_u8_vec(ab->qs, w8),
-                                       _mm256_set1_ps(d * (float)sc[j] * ab->d), vacc);
-                msum += dmin * (float)mn[j] * ab->d * (float)ab->sum;
+                vacc = _mm256_fmadd_ps(dot_u8_vec(ab0->qs, wlo),
+                                       _mm256_set1_ps(d * (float)sc[2 * j] * ab0->d), vacc);
+                vacc = _mm256_fmadd_ps(dot_u8_vec(ab1->qs, whi),
+                                       _mm256_set1_ps(d * (float)sc[2 * j + 1] * ab1->d), vacc);
+                msum += dmin * (float)mn[2 * j] * ab0->d * (float)ab0->sum;
+                msum += dmin * (float)mn[2 * j + 1] * ab1->d * (float)ab1->sum;
             }
         }
         acc = hsum256_ps(vacc) - msum;
@@ -344,19 +354,23 @@ static float dot_q4_K(const uint8_t *row, const nita_aq8_t *a, int nb)
         int            j;
 
         q4k_scales(blk + 4, sc, mn);
-        for (j = 0; j < 8; ++j) {
-            const nita_aq8_t *ab = &a[sb * 8 + j];
-            int8_t            w8[32];
-            int32_t           sum = 0;
+        for (j = 0; j < 4; ++j) {
+            const nita_aq8_t *ab0 = &a[sb * 8 + 2 * j];
+            const nita_aq8_t *ab1 = &a[sb * 8 + 2 * j + 1];
+            int8_t            wlo[32], whi[32];
+            int32_t           s0 = 0, s1 = 0;
             int               l;
 
-            for (l = 0; l < 16; ++l) {
-                w8[l]      = (int8_t)(qs[j * 16 + l] & 0x0F);
-                w8[16 + l] = (int8_t)(qs[j * 16 + l] >> 4);
+            for (l = 0; l < 32; ++l) {
+                wlo[l] = (int8_t)(qs[j * 32 + l] & 0x0F);
+                whi[l] = (int8_t)(qs[j * 32 + l] >> 4);
             }
-            for (l = 0; l < 32; ++l) sum += (int32_t)ab->qs[l] * w8[l];
-            acc  += d * (float)sc[j] * ab->d * (float)sum;
-            acc  -= dmin * (float)mn[j] * ab->d * (float)ab->sum;
+            for (l = 0; l < 32; ++l) s0 += (int32_t)ab0->qs[l] * wlo[l];
+            for (l = 0; l < 32; ++l) s1 += (int32_t)ab1->qs[l] * whi[l];
+            acc  += d * (float)sc[2 * j] * ab0->d * (float)s0;
+            acc  += d * (float)sc[2 * j + 1] * ab1->d * (float)s1;
+            acc  -= dmin * (float)mn[2 * j] * ab0->d * (float)ab0->sum;
+            acc  -= dmin * (float)mn[2 * j + 1] * ab1->d * (float)ab1->sum;
         }
     }
 #endif
@@ -1771,6 +1785,486 @@ static float dot_iq4_xs(const uint8_t *row, const nita_aq8_t *a, int nb)
     return acc;
 }
 
+/* IQ4_NL: 18 bytes / 32 weights, fp16 d, NIBBLE is a codebook index.
+ * Same layout as IQ4_XS without the per-sub-block scales: low nibbles hold
+ * elements 0-15, high nibbles elements 16-31. */
+static float dot_iq4_nl(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   b;
+
+#if defined(__AVX2__)
+    {
+        const __m256i tbl = _mm256_broadcastsi128_si256(
+                                _mm_loadu_si128((const __m128i *)g_iq4nl));
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+        __m256        vacc = _mm256_setzero_ps();
+
+        for (b = 0; b < nb; ++b) {
+            const uint8_t  *blk = row + (size_t)b * 18;
+            const nita_aq8_t *ab = &a[b];
+            float           d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const __m128i   q   = _mm_loadu_si128((const __m128i *)(blk + 2));
+            const __m256i   nib = _mm256_set_m128i(
+                                      _mm_and_si128(_mm_srli_epi16(q, 4), m0f),
+                                      _mm_and_si128(q, m0f));
+            const __m256i   w8  = _mm256_shuffle_epi8(tbl, nib);
+
+            vacc = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w8),
+                                   _mm256_set1_ps(d * ab->d), vacc);
+        }
+        acc = hsum256_ps(vacc);
+    }
+#else
+    for (b = 0; b < nb; ++b) {
+        const uint8_t  *blk = row + (size_t)b * 18;
+        const nita_aq8_t *ab = &a[b];
+        float           d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t  *qs  = blk + 2;
+        int32_t         s   = 0;
+        int             l;
+
+        for (l = 0; l < 16; ++l) {
+            s += (int32_t)ab->qs[l]      * (int32_t)g_iq4nl[qs[l] & 0x0F];
+            s += (int32_t)ab->qs[16 + l] * (int32_t)g_iq4nl[qs[l] >> 4];
+        }
+        acc += d * ab->d * (float)s;
+    }
+#endif
+    return acc;
+}
+
+/* ------------------------------------------------------------------ */
+/* IQ-quant (i-quant) integer kernels.                                */
+/*                                                                     */
+/* Grid/sign tables are vendored verbatim in iq_tables.h (upstream     */
+/* ggml-common.h, MIT). Every grid value fits an int8, so each 32-     */
+/* element block decodes into a plain int8 vector and rides the same   */
+/* maddubs/madd path as the K-quants. Float scale multiplies happen    */
+/* once per sub-block, never per weight.                               */
+/*                                                                     */
+/* Sign conventions differ per type, and mixing them up is silent      */
+/* corruption, so they are spelled out at each site:                   */
+/*   IQ2_XXS/IQ2_XS/IQ3_XXS : 7-bit index -> ksigns64[i] (0x00/0xff)   */
+/*   IQ2_S/IQ3_S            : sign byte stored raw -> signmask64[b]    */
+/*   IQ1_S/IQ1_M            : no sign byte; the grid holds int8 incl.  */
+/*                            sign, and the delta term needs the sum   */
+/*                            of the activations per block/8 group.    */
+/* ------------------------------------------------------------------ */
+static int8_t iq_sneg(uint8_t g, uint8_t m)
+{
+    /* m is 0x00 or 0xff. (g ^ 0xff) - 0xff == ~g + 1 == -g (byte wrap). */
+    return (int8_t)(((g ^ m) - m) & 0xFFu);
+}
+
+static void iq_grid8(const uint64_t *grid, int idx, uint64_t m64, int8_t *w)
+{
+    uint64_t  g;
+    const uint8_t *gb = (const uint8_t *)&g;
+    int       j;
+
+    memcpy(&g, grid + idx, sizeof g);
+    for (j = 0; j < 8; ++j)
+        w[j] = iq_sneg(gb[j], (uint8_t)(m64 >> (8 * j)));
+}
+
+static void iq_grid4x2(const uint32_t *grid, int idx1, int idx2, uint64_t m64,
+                       int8_t *w)
+{
+    uint32_t  g1, g2;
+    const uint8_t *a = (const uint8_t *)&g1, *b = (const uint8_t *)&g2;
+    int       j;
+
+    memcpy(&g1, grid + idx1, sizeof g1);
+    memcpy(&g2, grid + idx2, sizeof g2);
+    for (j = 0; j < 4; ++j) w[j]     = iq_sneg(a[j], (uint8_t)(m64 >> (8 * j)));
+    for (j = 0; j < 4; ++j) w[4 + j] = iq_sneg(b[j], (uint8_t)(m64 >> (8 * (4 + j))));
+}
+
+#if defined(__AVX2__)
+static __m256 iq_dot32(const int8_t *x, const int8_t *w8)
+{
+    return dot_i8_vec(x, _mm256_loadu_si256((const __m256i *)w8));
+}
+static int iq_dot16(const int8_t *x, const int8_t *w8)
+{
+    return dot_i8_16(x, _mm_loadu_si128((const __m128i *)w8));
+}
+#else
+static int iq_dot32_scalar(const int8_t *x, const int8_t *w8)
+{
+    int32_t s = 0;
+    int     j;
+
+    for (j = 0; j < 32; ++j) s += (int32_t)x[j] * (int32_t)w8[j];
+    return s;
+}
+#endif
+
+/* ggml type 16: IQ2_XXS. 66 bytes / 256 weights.
+ *   d fp16; qs i.e. 8 sub-blocks of (4 grid idx bytes + uint32 scales/signs) */
+static float dot_iq2_xxs(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+#if defined(__AVX2__)
+    __m256 vacc = _mm256_setzero_ps();
+#endif
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row + (size_t)sb * 66;
+        float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qsb = blk + 2;
+        int            ib32;
+
+        for (ib32 = 0; ib32 < 8; ++ib32) {
+            const nita_aq8_t *ab = &a[sb * 8 + ib32];
+            uint32_t        aux0, aux1;
+            float           db;
+            const uint8_t  *gi;
+            int8_t          w8[32];
+            int             l;
+
+            memcpy(&aux0, qsb + 8 * ib32, sizeof aux0);
+            memcpy(&aux1, qsb + 8 * ib32 + 4, sizeof aux1);
+            db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+            gi = (const uint8_t *)&aux0;
+
+            for (l = 0; l < 4; ++l)
+                iq_grid8(nita_iq2xxs_grid, gi[l],
+                         nita_ksigns64[(aux1 >> 7 * l) & 127], w8 + 8 * l);
+#if defined(__AVX2__)
+            vacc = _mm256_fmadd_ps(iq_dot32(ab->qs, w8),
+                                   _mm256_set1_ps(db * ab->d), vacc);
+#else
+            acc += db * ab->d * (float)iq_dot32_scalar(ab->qs, w8);
+#endif
+        }
+    }
+#if defined(__AVX2__)
+    acc = hsum256_ps(vacc);
+#endif
+    return acc;
+}
+
+/* ggml type 17: IQ2_XS. 74 bytes / 256 weights.
+ *   d fp16; qs uint16[32] (9 grid bits + 7 sign bits); scales uint8[8]. */
+static float dot_iq2_xs(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row + (size_t)sb * 74;
+        float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint16_t *qs = (const uint16_t *)(blk + 2);
+        const uint8_t *sc  = blk + 66;
+        int            ib32;
+
+        for (ib32 = 0; ib32 < 8; ++ib32) {
+            const nita_aq8_t *ab = &a[sb * 8 + ib32];
+            const uint8_t   s    = sc[ib32];
+            const float     db0  = d * (0.5f + (float)(s & 0x0F)) * 0.25f;
+            const float     db1  = d * (0.5f + (float)(s >> 4)) * 0.25f;
+            int8_t          w8[32];
+            int             l;
+
+            for (l = 0; l < 4; ++l) {
+                const uint16_t q = qs[4 * ib32 + l];
+
+                iq_grid8(nita_iq2xs_grid, (int)(q & 511),
+                         nita_ksigns64[q >> 9], w8 + 8 * l);
+            }
+#if defined(__AVX2__)
+            acc += ab->d * (db0 * (float)iq_dot16(ab->qs, w8)
+                          + db1 * (float)iq_dot16(ab->qs + 16, w8 + 16));
+#else
+            {
+                int32_t s0 = 0, s1 = 0, j;
+
+                for (j = 0; j < 16; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                for (j = 0; j < 16; ++j) s1 += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                acc += ab->d * (db0 * (float)s0 + db1 * (float)s1);
+            }
+#endif
+        }
+    }
+    return acc;
+}
+
+/* ggml type 22: IQ2_S. 82 bytes / 256 weights.
+ *   d fp16; qs uint8[64] (first 32 grid idx, next 32 raw sign bits);
+ *   qh uint8[8] (grid idx bits 8-9); scales uint8[8]. */
+static float dot_iq2_s(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row + (size_t)sb * 82;
+        float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qs  = blk + 2;
+        const uint8_t *qh  = blk + 66;
+        const uint8_t *signs = qs + 32;
+        const uint8_t *sc  = blk + 74;
+        int            ib32;
+
+        for (ib32 = 0; ib32 < 8; ++ib32) {
+            const nita_aq8_t *ab = &a[sb * 8 + ib32];
+            const uint8_t   s    = sc[ib32];
+            const float     db0  = d * (0.5f + (float)(s & 0x0F)) * 0.25f;
+            const float     db1  = d * (0.5f + (float)(s >> 4)) * 0.25f;
+            int8_t          w8[32];
+            int             l;
+
+            for (l = 0; l < 4; ++l) {
+                const int idx = qs[4 * ib32 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+
+                iq_grid8(nita_iq2s_grid, idx,
+                         nita_signmask64[signs[4 * ib32 + l]], w8 + 8 * l);
+            }
+#if defined(__AVX2__)
+            acc += ab->d * (db0 * (float)iq_dot16(ab->qs, w8)
+                          + db1 * (float)iq_dot16(ab->qs + 16, w8 + 16));
+#else
+            {
+                int32_t s0 = 0, s1 = 0, j;
+
+                for (j = 0; j < 16; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                for (j = 0; j < 16; ++j) s1 += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                acc += ab->d * (db0 * (float)s0 + db1 * (float)s1);
+            }
+#endif
+        }
+    }
+    return acc;
+}
+
+/* ggml type 18: IQ3_XXS. 98 bytes / 256 weights.
+ *   d fp16; qs uint8[96] (first 64 grid idx, next 32 scales+signs). */
+static float dot_iq3_xxs(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+#if defined(__AVX2__)
+    __m256 vacc = _mm256_setzero_ps();
+#endif
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row + (size_t)sb * 98;
+        float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qs  = blk + 2;
+        const uint8_t *scales_and_signs = qs + 64;
+        int            ib32;
+
+        for (ib32 = 0; ib32 < 8; ++ib32) {
+            const nita_aq8_t *ab = &a[sb * 8 + ib32];
+            uint32_t        aux32;
+            float           db;
+            const uint8_t  *q   = qs + 8 * ib32;
+            int8_t          w8[32];
+            int             l;
+
+            memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof aux32);
+            db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            for (l = 0; l < 4; ++l)
+                iq_grid4x2(nita_iq3xxs_grid, q[2 * l + 0], q[2 * l + 1],
+                           nita_ksigns64[(aux32 >> 7 * l) & 127], w8 + 8 * l);
+#if defined(__AVX2__)
+            vacc = _mm256_fmadd_ps(iq_dot32(ab->qs, w8),
+                                   _mm256_set1_ps(db * ab->d), vacc);
+#else
+            acc += db * ab->d * (float)iq_dot32_scalar(ab->qs, w8);
+#endif
+        }
+    }
+#if defined(__AVX2__)
+    acc = hsum256_ps(vacc);
+#endif
+    return acc;
+}
+
+/* ggml type 21: IQ3_S. 110 bytes / 256 weights.
+ *   d fp16; qs uint8[64]; qh uint8[8]; signs uint8[32]; scales uint8[4]
+ *   (2 nibbles per 32-block, one pair of blocks per byte). */
+static float dot_iq3_s(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+#if defined(__AVX2__)
+    __m256 vacc = _mm256_setzero_ps();
+#endif
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk  = row + (size_t)sb * 110;
+        float          d    = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qs   = blk + 2;
+        const uint8_t *qh   = blk + 66;
+        const uint8_t *signs = blk + 74;
+        const uint8_t *sc   = blk + 106;
+        int            ib32;
+
+        for (ib32 = 0; ib32 < 8; ib32 += 2) {
+            const nita_aq8_t *ab1 = &a[sb * 8 + ib32];
+            const nita_aq8_t *ab2 = &a[sb * 8 + ib32 + 1];
+            const float      db1  = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] & 0x0F));
+            const float      db2  = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] >> 4));
+            const uint8_t   *q1   = qs + 8 * ib32;
+            const uint8_t   *sn1  = signs + 4 * ib32;
+            int8_t           w8[32];
+            int              l;
+
+            for (l = 0; l < 4; ++l)
+                iq_grid4x2(nita_iq3s_grid,
+                           (int)(q1[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 0x100)),
+                           (int)(q1[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 0x100)),
+                           nita_signmask64[sn1[l]], w8 + 8 * l);
+#if defined(__AVX2__)
+            vacc = _mm256_fmadd_ps(iq_dot32(ab1->qs, w8),
+                                   _mm256_set1_ps(db1 * ab1->d), vacc);
+#else
+            acc += db1 * ab1->d * (float)iq_dot32_scalar(ab1->qs, w8);
+#endif
+            {
+                const uint8_t *q2  = q1 + 8;
+                const uint8_t *sn2 = sn1 + 4;
+
+                for (l = 0; l < 4; ++l)
+                    iq_grid4x2(nita_iq3s_grid,
+                               (int)(q2[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 0x100)),
+                               (int)(q2[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 0x100)),
+                               nita_signmask64[sn2[l]], w8 + 8 * l);
+#if defined(__AVX2__)
+                vacc = _mm256_fmadd_ps(iq_dot32(ab2->qs, w8),
+                                       _mm256_set1_ps(db2 * ab2->d), vacc);
+#else
+                acc += db2 * ab2->d * (float)iq_dot32_scalar(ab2->qs, w8);
+#endif
+            }
+            qh    += 2;
+        }
+    }
+#if defined(__AVX2__)
+    acc = hsum256_ps(vacc);
+#endif
+    return acc;
+}
+
+/* ggml type 19: IQ1_S. 50 bytes / 256 weights.
+ *   d fp16; qs uint8[32] grid idx bytes; qh uint16[8] (idx bits 8-10,
+ *   per-block scale and delta sign). value = dl*(grid + delta). */
+static float dot_iq1_s(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row + (size_t)sb * 50;
+        float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qs  = blk + 2;
+        const uint16_t *qh = (const uint16_t *)(blk + 34);
+        int            ib;
+
+        for (ib = 0; ib < 8; ++ib) {
+            const nita_aq8_t *ab = &a[sb * 8 + ib];
+            const uint16_t  qhv  = qh[ib];
+            const float     dl   = d * (2.0f * (float)((qhv >> 12) & 7) + 1.0f);
+            const float     delta = (qhv & 0x8000u) ? -0.125f : 0.125f;
+            int8_t          w8[32];
+            int             l;
+
+            for (l = 0; l < 4; ++l) {
+                const uint64_t *g = nita_iq1s_grid + (qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8));
+                memcpy(w8 + 8 * l, g, 8);   /* grid bytes are int8 already */
+            }
+#if defined(__AVX2__)
+            acc += ab->d * dl * (hsum256_ps(iq_dot32(ab->qs, w8)) + delta * (float)ab->sum);
+#else
+            acc += ab->d * dl * ((float)iq_dot32_scalar(ab->qs, w8) + delta * (float)ab->sum);
+#endif
+        }
+    }
+    return acc;
+}
+
+/* ggml type 29: IQ1_M. 56 bytes / 256 weights, no fp16 d in the block:
+ * the scale is synthesised from 12 bits spread over the four scale u16s.
+ *   qs uint8[32] grid idx bytes; qh uint8[16] (idx bits 8-10, delta
+ *   signs); scales uint8[8] (3-bit scales + 12 bits of d). */
+static float dot_iq1_m(const uint8_t *row, const nita_aq8_t *a, int nb)
+{
+    float acc = 0.0f;
+    int   sb;
+
+    for (sb = 0; sb < nb / 8; ++sb) {
+        const uint8_t *blk = row;
+        uint16_t       sc[4];
+        uint16_t       su;
+        float          d;
+
+        row += 56;
+        memcpy(sc, blk + 48, sizeof sc);
+        su = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
+                      | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        d  = nita_f16_to_f32(su);
+        {
+            const uint8_t *qs = blk + 0;
+            const uint8_t *qh = blk + 32;
+            int            ib;
+
+            for (ib = 0; ib < 8; ++ib) {
+                const nita_aq8_t *ab = &a[sb * 8 + ib];
+                const uint16_t   s   = sc[ib / 2];
+                const float      dl1 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 0)) & 7) + 1.0f);
+                const float      dl2 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 3)) & 7) + 1.0f);
+                const uint8_t   q_0  = qs[4 * ib + 0], q_1 = qs[4 * ib + 1];
+                const uint8_t   q_2  = qs[4 * ib + 2], q_3 = qs[4 * ib + 3];
+                const uint8_t   h_0  = qh[2 * ib + 0], h_1 = qh[2 * ib + 1];
+                const int       idx0 = q_0 | ((h_0 << 8) & 0x700);
+                const int       idx1 = q_1 | ((h_0 << 4) & 0x700);
+                const int       idx2 = q_2 | ((h_1 << 8) & 0x700);
+                const int       idx3 = q_3 | ((h_1 << 4) & 0x700);
+                const float     d0 = (h_0 & 0x08) ? -0.125f : 0.125f;
+                const float     d1 = (h_0 & 0x80) ? -0.125f : 0.125f;
+                const float     d2 = (h_1 & 0x08) ? -0.125f : 0.125f;
+                const float     d3 = (h_1 & 0x80) ? -0.125f : 0.125f;
+                int8_t          w8[32];
+                uint64_t        g;
+
+                memcpy(&g, nita_iq1s_grid + idx0, 8); memcpy(w8 +  0, (const uint8_t *)&g, 8);
+                memcpy(&g, nita_iq1s_grid + idx1, 8); memcpy(w8 +  8, (const uint8_t *)&g, 8);
+                memcpy(&g, nita_iq1s_grid + idx2, 8); memcpy(w8 + 16, (const uint8_t *)&g, 8);
+                memcpy(&g, nita_iq1s_grid + idx3, 8); memcpy(w8 + 24, (const uint8_t *)&g, 8);
+#if defined(__AVX2__)
+                {
+                    const int lo = iq_dot16(ab->qs, w8);
+                    const int hi = iq_dot16(ab->qs + 16, w8 + 16);
+
+                    acc += ab->d * (dl1 * ((float)lo + d0 * (float)ab->sums[0]
+                                                      + d1 * (float)ab->sums[1])
+                                  + dl2 * ((float)hi + d2 * (float)ab->sums[2]
+                                                      + d3 * (float)ab->sums[3]));
+                }
+#else
+                {
+                    int32_t s0 = 0, s1 = 0, s2_ = 0, s3 = 0, j;
+
+                    for (j = 0; j < 8; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                    for (j = 0; j < 8; ++j) s1 += (int32_t)ab->qs[8 + j] * w8[8 + j];
+                    for (j = 0; j < 8; ++j) s2_ += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                    for (j = 0; j < 8; ++j) s3 += (int32_t)ab->qs[24 + j] * w8[24 + j];
+                    acc += ab->d * (dl1 * ((float)(s0 + s1) + d0 * (float)ab->sums[0]
+                                                              + d1 * (float)ab->sums[1])
+                                  + dl2 * ((float)(s2_ + s3) + d2 * (float)ab->sums[2]
+                                                              + d3 * (float)ab->sums[3]));
+                }
+#endif
+            }
+        }
+    }
+    return acc;
+}
+
 /* MXFP4: 17 bytes / 32 weights, E8M0 block scale, doubled e2m1 codes */
 static float dot_mxfp4(const uint8_t *row, const nita_aq8_t *a, int nb)
 {
@@ -1929,23 +2423,85 @@ static void dot_tile_q4_K(const uint8_t *row, const nita_aq8_t *a, int stride,
             int            j;
 
             q4k_scales(blk + 4, sc, mn);
-            for (j = 0; j < 8; ++j) {
-                int8_t w8[32];
+            for (j = 0; j < 4; ++j) {
+                int8_t wlo[32], whi[32];
                 int    l;
 
-                for (l = 0; l < 16; ++l) {
-                    w8[l]      = (int8_t)(qs[j * 16 + l] & 0x0F);
-                    w8[16 + l] = (int8_t)(qs[j * 16 + l] >> 4);
+                for (l = 0; l < 32; ++l) {
+                    wlo[l] = (int8_t)(qs[j * 32 + l] & 0x0F);
+                    whi[l] = (int8_t)(qs[j * 32 + l] >> 4);
                 }
                 for (i = 0; i < t; ++i) {
-                    const nita_aq8_t *ai = &a[(size_t)i * stride + sb * 8 + j];
-                    int32_t           sum = 0;
+                    const nita_aq8_t *ai0 = &a[(size_t)i * stride + sb * 8 + 2 * j];
+                    const nita_aq8_t *ai1 = &a[(size_t)i * stride + sb * 8 + 2 * j + 1];
+                    int32_t           s0 = 0, s1 = 0;
 
-                    for (l = 0; l < 32; ++l) sum += (int32_t)ai->qs[l] * w8[l];
-                    out[(size_t)i * out_stride] += d * (float)sc[j] * ai->d * (float)sum
-                                                 - dmin * (float)mn[j] * ai->d * (float)ai->sum;
+                    for (l = 0; l < 32; ++l) s0 += (int32_t)ai0->qs[l] * wlo[l];
+                    for (l = 0; l < 32; ++l) s1 += (int32_t)ai1->qs[l] * whi[l];
+                    out[(size_t)i * out_stride] += d * (float)sc[2 * j] * ai0->d * (float)s0
+                                                 + d * (float)sc[2 * j + 1] * ai1->d * (float)s1
+                                                 - dmin * (float)mn[2 * j] * ai0->d * (float)ai0->sum
+                                                 - dmin * (float)mn[2 * j + 1] * ai1->d * (float)ai1->sum;
                 }
             }
+        }
+    }
+}
+
+/* IQ4_NL tile form: expand each weight block once, use it for every token in
+ * the tile. Mirrors dot_tile_q8_0. */
+static void dot_tile_iq4_nl(const uint8_t *row, const nita_aq8_t *a, int stride,
+                            int t, int nb, float *out, int out_stride)
+{
+    int i, b, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        const __m256i tbl = _mm256_broadcastsi128_si256(
+                                _mm_loadu_si128((const __m128i *)g_iq4nl));
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (b = 0; b < nb; ++b) {
+            const uint8_t *blk = row + (size_t)b * 18;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const __m128i  q   = _mm_loadu_si128((const __m128i *)(blk + 2));
+            const __m256i  nib = _mm256_set_m128i(
+                                     _mm_and_si128(_mm_srli_epi16(q, 4), m0f),
+                                     _mm_and_si128(q, m0f));
+            const __m256i  w   = _mm256_shuffle_epi8(tbl, nib);
+
+            for (i = 0; i < tc; ++i) {
+                const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + b];
+
+                vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ai->qs, w),
+                                          _mm256_set1_ps(dw * ai->d), vacc[i]);
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i) out[(size_t)i * out_stride] = 0.0f;
+    for (b = 0; b < nb; ++b) {
+        const uint8_t *blk = row + (size_t)b * 18;
+        float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const uint8_t *qs  = blk + 2;
+
+        for (i = 0; i < t; ++i) {
+            const nita_aq8_t *ai = &a[(size_t)i * stride + b];
+            int32_t           sum = 0;
+            int               l;
+
+            for (l = 0; l < 16; ++l) {
+                sum += (int32_t)ai->qs[l]      * (int32_t)g_iq4nl[qs[l] & 0x0F];
+                sum += (int32_t)ai->qs[16 + l] * (int32_t)g_iq4nl[qs[l] >> 4];
+            }
+            out[(size_t)i * out_stride] += dw * ai->d * (float)sum;
         }
     }
 }
@@ -1956,6 +2512,7 @@ void nita_quant_dot_tile(uint32_t type, const uint8_t *row,
 {
     if (type == 8) { dot_tile_q8_0(row, a, stride, t, nb, out, out_stride); return; }
     if (type == 12) { dot_tile_q4_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 20) { dot_tile_iq4_nl(row, a, stride, t, nb, out, out_stride); return; }
 
     /* Types without a fused tile form still stay in the integer domain, they
      * just expand the weights once per token instead of once per tile. */
@@ -1985,7 +2542,15 @@ int nita_quant_has_int_dot(uint32_t type)
     case 13: /* Q5_K   */
     case 14: /* Q6_K   */
     case 15: /* Q8_K   */
-    case 23: /* IQ4_XS */
+    case 16: /* IQ2_XXS */
+    case 17: /* IQ2_XS  */
+    case 18: /* IQ3_XXS */
+    case 19: /* IQ1_S   */
+    case 20: /* IQ4_NL  */
+    case 21: /* IQ3_S   */
+    case 22: /* IQ2_S   */
+    case 23: /* IQ4_XS  */
+    case 29: /* IQ1_M   */
     case 34: /* TQ1_0  */
     case 35: /* TQ2_0  */
     case 39: /* MXFP4  */
@@ -2015,7 +2580,15 @@ float nita_quant_dot(uint32_t type, const uint8_t *row, const nita_aq8_t *a,
     case 12: return dot_q4_K(row, a, nb);
     case 13: return dot_q5_K(row, a, nb);
     case 14: return dot_q6_K(row, a, nb);
+    case 16: return dot_iq2_xxs(row, a, nb);
+    case 17: return dot_iq2_xs(row, a, nb);
+    case 18: return dot_iq3_xxs(row, a, nb);
+    case 19: return dot_iq1_s(row, a, nb);
+    case 20: return dot_iq4_nl(row, a, nb);
+    case 21: return dot_iq3_s(row, a, nb);
+    case 22: return dot_iq2_s(row, a, nb);
     case 23: return dot_iq4_xs(row, a, nb);
+    case 29: return dot_iq1_m(row, a, nb);
     case 34: return dot_tq1_0(row, a, nb);
     case 35: return dot_tq2_0(row, a, nb);
     case 39: return dot_mxfp4(row, a, nb);
