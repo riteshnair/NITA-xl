@@ -22,6 +22,10 @@
 
 #include <stdint.h>
 
+/* True when the engine has a decoder for this GGUF tensor type: refusing an
+ * unknown quant at load time is the contract, never partial output. */
+int nita_type_supported(uint32_t type);
+
 /* One quantised 32-element activation block. `sum` is kept because the
  * K-quants carry a per-sub-block minimum, and the min term needs the sum of
  * the activations over the same block. */
