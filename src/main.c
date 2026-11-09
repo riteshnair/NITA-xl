@@ -22,18 +22,11 @@
 #  include <windows.h>
 #endif
 
-/* Kernel entry point provided by q4_matmul.c (one implementation is
- * compiled in, chosen by the CMake -D flags). */
-extern void q4_matmul_kernel(const float *restrict scales,
-                             const uint8_t *restrict A,
-                             const float *restrict B_scales,
-                             const int32_t *restrict B,
-                             int32_t *restrict out,
-                             int M, int N, int K);
-
-/* Quantisation type the binary was built with.  The CMake flags define each
+/* The quantisation preset the binary was configured with.  The CMake flags define each
  * selector as the integer 1, so the human-readable name must be chosen with
- * an explicit #if chain rather than by stringizing QUANT_TYPE. */
+ * an explicit #if chain rather than by stringizing QUANT_TYPE.  It is a label
+ * for --version and the server log only: the model path uses the quantised
+ * dot kernels in src/quant.c, selected by tensor type at load time. */
 #ifndef QUANT_TYPE
 #  define QUANT_TYPE Q4_K_M
 #endif
@@ -70,7 +63,7 @@ static void print_usage(FILE *f, const char *argv0)
         "  --port <n>          listen port (default 7777)\n"
         "  --ctx <n>           context size reported to clients (default 2048)\n"
         "  --name <id>         model id served by /v1/models (default: file stem)\n"
-        "  --quant-type <name> label to report for the compiled kernel\n"
+        "  --quant-type <name> label to report for the configured quantisation preset\n"
         "  --inspect           print model metadata and exit\n"
         "  --tensor-table      print every tensor's name, type, dims, offsets\n"
         "                      and a hash of its first bytes, tab-separated\n"
@@ -110,20 +103,6 @@ static char *derive_model_id(const char *path)
     memcpy(id, base, len);
     id[len] = '\0';
     return id;
-}
-
-/* Exercise the compiled quantised kernel once so operators can see it work. */
-static void kernel_probe(void)
-{
-    static float   scales[1]   = { 1.0f };
-    static uint8_t a[2]        = { 0x55, 0xAA };
-    static float   b_scales[1] = { 1.0f };
-    static int32_t b[1]        = { 1 };
-    int32_t        out = 0;
-
-    BREADCRUMB("kernel", "probing compiled kernel");
-    q4_matmul_kernel(scales, a, b_scales, b, &out, 1, 1, 1);
-    printf("[nita] kernel (%s) probe: out=%d\n", NITA_QUANT_NAME, out);
 }
 
 /* Read all of stdin as UTF-8 bytes. */
@@ -1122,7 +1101,6 @@ int main(int argc, char **argv)
             return lrc;
         }
 
-        kernel_probe();
         SHERLOCK_HEADER();
         SHERLOCK_ROW("model-load", (int)g->tensor_count, 100.0, 0.0, 0.0, 0.0);
 

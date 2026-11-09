@@ -125,7 +125,7 @@ static int run_blob(const char *path)
     nita_aq8_quantise(x, (int)hdr[1], aq);
 
     for (r = 0; r < (int)hdr[2]; ++r) {
-        double ae;
+        double ae = 0.0;
         double rel = one_row(hdr[0], blob + (size_t)r * hdr[3], hdr[1], nb,
                              row, x, aq, &ae);
 
@@ -250,8 +250,8 @@ static int run_type(const gguf_file_t *g, uint32_t type, int max_rows,
         for (r = 0; r < k; ++r) x[r] = frand();
         nita_aq8_quantise(x, (int)k, aq);
 
-        for (r = 0; r < (size_t)(max_rows < (int)nrows ? max_rows : nrows); ++r) {
-            double ae;
+        for (r = 0; r < (size_t)((size_t)max_rows < nrows ? (size_t)max_rows : nrows); ++r) {
+            double ae = 0.0;
             double rel = one_row(t->type,
                                  g->data + g->data_offset + t->offset + r * row_bytes,
                                  (uint32_t)k, nb, row, x, aq, &ae);
@@ -315,7 +315,7 @@ static int run_tile_type(const gguf_file_t *g, uint32_t type, int max_rows,
             }
         }
 
-        maxr = (size_t)(max_rows < (int)nrows ? max_rows : (int)nrows);
+        maxr = ((size_t)max_rows < nrows ? (size_t)max_rows : nrows);
         for (r = 0; r < maxr; ++r) {
             const uint8_t *src = g->data + g->data_offset + t->offset + r * row_bytes;
             int             a;
