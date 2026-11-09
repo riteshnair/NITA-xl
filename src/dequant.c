@@ -9,6 +9,7 @@
  */
 
 #include "nita.h"
+#include "iq_tables.h"
 
 #include <math.h>
 #include <string.h>
@@ -84,32 +85,21 @@ size_t nita_row_bytes(uint32_t type, uint64_t ne0)
 /* ------------------------------------------------------------------ */
 /* K-quant scale unpacking (shared by Q4_K / Q5_K)                     */
 /* ------------------------------------------------------------------ */
+/* Upstream get_scale_min_k4, byte for byte: the ggml AVX2 unpack used to be
+ * transcribed here and decoded the wrong lanes, which silently produced
+ * garbage for every Q4_K / Q5_K tensor. Keep it scalar and obviously equal
+ * to get_scale_min_k4. */
 static void unpack_q4k_scales(const uint8_t *scales_in, int8_t scales[8], int8_t mins[8])
 {
-    uint32_t aux[4];
-    uint32_t tmp;
-    const uint32_t kmask1 = 0x3f3f3f3fu;
-    const uint32_t kmask2 = 0x0f0f0f0fu;
-    int i;
+    int j;
 
-    for (i = 0; i < 3; ++i) {
-        aux[i] = (uint32_t)scales_in[i * 4 + 0]
-               | ((uint32_t)scales_in[i * 4 + 1] << 8)
-               | ((uint32_t)scales_in[i * 4 + 2] << 16)
-               | ((uint32_t)scales_in[i * 4 + 3] << 24);
+    for (j = 0; j < 4; ++j) {
+        scales[j] = (int8_t)(scales_in[j] & 63);
+        mins[j]   = (int8_t)(scales_in[j + 4] & 63);
     }
-
-    tmp   = aux[2];
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp) & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-
-    for (i = 0; i < 8; ++i) {
-        scales[i] = (int8_t)((aux[i / 4] >> (8 * (i % 4))) & 0xFF);
-    }
-    for (i = 0; i < 8; ++i) {
-        mins[i] = (int8_t)((aux[2 + i / 4] >> (8 * (i % 4))) & 0xFF);
+    for (j = 4; j < 8; ++j) {
+        scales[j] = (int8_t)((scales_in[j + 4] & 0x0F) | ((scales_in[j - 4] >> 6) << 4));
+        mins[j]   = (int8_t)((scales_in[j + 4] >> 4) | ((scales_in[j] >> 6) << 4));
     }
 }
 
@@ -165,6 +155,18 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
             dst[i] = (float)(int32_t)v;
         }
         return 0;
+
+    case 27: { /* I64: low 64 bits, cast through double; values above 2^53
+                  lose integer precision in fp32, which is inherent */
+        for (i = 0; i < ne0; ++i) {
+            uint64_t v = 0;
+            int      b;
+
+            for (b = 7; b >= 0; --b) v = (v << 8) | src[i * 8 + b];
+            dst[i] = (float)(int64_t)v;
+        }
+        return 0;
+    }
 
     /* ---------------- legacy quants ---------------- */
     case 2: { /* Q4_0: 32 elements, 18 bytes */
@@ -384,15 +386,15 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
 
             unpack_q4k_scales(blk + 4, scales, mins);
 
-            for (j = 0; j < 8; ++j) {
-                float d1 = d * (float)scales[j];
-                float m1 = dmin * (float)mins[j];
+            for (j = 0; j < 4; ++j) {
+                float d1 = d * (float)scales[2 * j];
+                float m1 = dmin * (float)mins[2 * j];
+                float d2 = d * (float)scales[2 * j + 1];
+                float m2 = dmin * (float)mins[2 * j + 1];
                 int l;
-                for (l = 0; l < 16; ++l)
-                    y[j * 32 + l] = d1 * (float)(qs[l] & 0x0F) - m1;
-                for (l = 0; l < 16; ++l)
-                    y[j * 32 + 16 + l] = d1 * (float)(qs[l] >> 4) - m1;
-                qs += 16;
+                for (l = 0; l < 32; ++l) y[j * 64 + l] = d1 * (float)(qs[l] & 0x0F) - m1;
+                for (l = 0; l < 32; ++l) y[j * 64 + 32 + l] = d2 * (float)(qs[l] >> 4) - m2;
+                qs += 32;
             }
         }
         return 0;
@@ -470,6 +472,30 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
         return 0;
     }
 
+    case 20: { /* IQ4_NL: 32 elements, 18 bytes: fp16 d + 16 code bytes.
+                 * The nibble is an index into the ggml non-linear codebook,
+                 * not a linear offset. Low nibbles hold elements 0-15, high
+                 * nibbles elements 16-31 (same layout as Q4_0). */
+        static const int8_t kv[16] = {
+            -127, -104, -83, -65, -49, -35, -22, -10,
+               1,   13,  25,  38,  53,  69,  89, 113
+        };
+        uint64_t nb = ne0 / 32;
+
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 18;
+            float          d   = rd_f16(blk);
+            const uint8_t *qs  = blk + 2;
+            int            l;
+
+            for (l = 0; l < 16; ++l) {
+                dst[i * 32 + l]      = d * (float)kv[qs[l] & 0x0F];
+                dst[i * 32 + 16 + l] = d * (float)kv[qs[l] >> 4];
+            }
+        }
+        return 0;
+    }
+
     case 23: { /* IQ4_XS: 256 elements, 136 bytes */
         /* Non-linear 4-bit codebook; the values are the ggml table verbatim.
          * Indexing it with the nibble is the whole of IQ4_XS decoding: unlike
@@ -524,7 +550,257 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
         return 0;
     }
 
+    case 16: { /* IQ2_XXS: 256 elements, 66 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t  *blk = src + i * 66;
+            float           d   = rd_f16(blk);
+            const uint16_t *qs  = (const uint16_t *)(blk + 2);
+            float          *y   = dst + i * 256;
+            int             ib32;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                uint32_t aux[2];
+                const uint8_t *aux8 = (const uint8_t *)aux;
+                float db;
+                int l, j;
+
+                memcpy(aux, qs + 4 * ib32, sizeof aux);
+                db = d * (0.5f + (float)(aux[1] >> 28)) * 0.25f;
+                for (l = 0; l < 4; ++l) {
+                    const uint8_t *grid = (const uint8_t *)(nita_iq2xxs_grid + aux8[l]);
+                    const uint8_t  sb   = nita_ksigns_iq2xs[(aux[1] >> 7 * l) & 127];
+
+                    for (j = 0; j < 8; ++j)
+                        y[ib32 * 32 + l * 8 + j] =
+                            db * (float)(int8_t)grid[j] * ((sb & (1u << j)) ? -1.0f : 1.0f);
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 17: { /* IQ2_XS: 256 elements, 74 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t  *blk = src + i * 74;
+            float           d   = rd_f16(blk);
+            const uint16_t *qs  = (const uint16_t *)(blk + 2);
+            const uint8_t  *sl  = blk + 66;
+            float          *y   = dst + i * 256;
+            int             ib32;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                const float db[2] = { d * (0.5f + (float)(sl[ib32] & 0x0F)) * 0.25f,
+                                      d * (0.5f + (float)(sl[ib32] >> 4)) * 0.25f };
+                int         l, j;
+
+                for (l = 0; l < 4; ++l) {
+                    const uint16_t q    = qs[4 * ib32 + l];
+                    const uint8_t *grid = (const uint8_t *)(nita_iq2xs_grid + (q & 511));
+                    const uint8_t  sb   = nita_ksigns_iq2xs[q >> 9];
+                    const float    dl   = db[l / 2];
+
+                    for (j = 0; j < 8; ++j)
+                        y[ib32 * 32 + l * 8 + j] =
+                            dl * (float)(int8_t)grid[j] * ((sb & (1u << j)) ? -1.0f : 1.0f);
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 22: { /* IQ2_S: 256 elements, 82 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk   = src + i * 82;
+            float          d     = rd_f16(blk);
+            const uint8_t *qs    = blk + 2;
+            const uint8_t *qh    = blk + 66;
+            const uint8_t *signs = qs + 32;
+            const uint8_t *sl    = blk + 74;
+            float         *y     = dst + i * 256;
+            int            ib32;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                const float db[2] = { d * (0.5f + (float)(sl[ib32] & 0x0F)) * 0.25f,
+                                      d * (0.5f + (float)(sl[ib32] >> 4)) * 0.25f };
+                int         l, j;
+
+                for (l = 0; l < 4; ++l) {
+                    const uint8_t *grid = (const uint8_t *)(
+                        nita_iq2s_grid + (qs[4 * ib32 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                    const uint8_t  sb = signs[4 * ib32 + l];
+                    const float    dl = db[l / 2];
+
+                    for (j = 0; j < 8; ++j)
+                        y[ib32 * 32 + l * 8 + j] =
+                            dl * (float)(int8_t)grid[j] * ((sb & (1u << j)) ? -1.0f : 1.0f);
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 18: { /* IQ3_XXS: 256 elements, 98 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 98;
+            float          d   = rd_f16(blk);
+            const uint8_t *qs  = blk + 2;
+            const uint8_t *scales_and_signs = qs + 64;
+            float         *y   = dst + i * 256;
+            int            ib32;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                uint32_t        aux32;
+                const uint8_t  *q = qs + 8 * ib32;
+                float           db;
+                int             l, j;
+
+                memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof aux32);
+                db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+                for (l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = (const uint8_t *)(nita_iq3xxs_grid + q[2 * l + 0]);
+                    const uint8_t *grid2 = (const uint8_t *)(nita_iq3xxs_grid + q[2 * l + 1]);
+                    const uint8_t  sb    = nita_ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+
+                    for (j = 0; j < 4; ++j) {
+                        y[ib32 * 32 + l * 8 + j]     = db * (float)(int8_t)grid1[j]
+                                                     * ((sb & (1u << (j + 0))) ? -1.0f : 1.0f);
+                        y[ib32 * 32 + l * 8 + 4 + j] = db * (float)(int8_t)grid2[j]
+                                                     * ((sb & (1u << (j + 4))) ? -1.0f : 1.0f);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 21: { /* IQ3_S: 256 elements, 110 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk   = src + i * 110;
+            float          d     = rd_f16(blk);
+            const uint8_t *qs    = blk + 2;
+            const uint8_t *qh    = blk + 66;
+            const uint8_t *signs = blk + 74;
+            const uint8_t *sc    = blk + 106;
+            float         *y     = dst + i * 256;
+            int            ib32;
+
+            for (ib32 = 0; ib32 < 8; ib32 += 2) {
+                const float db1 = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] & 0x0F));
+                const float db2 = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] >> 4));
+                const uint8_t *q1 = qs + 8 * ib32, *sn1 = signs + 4 * ib32;
+                const uint8_t *q2 = q1 + 8, *sn2 = sn1 + 4;
+                int            l, j;
+
+                for (l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = (const uint8_t *)(
+                        nita_iq3s_grid + (q1[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 0x100)));
+                    const uint8_t *grid2 = (const uint8_t *)(
+                        nita_iq3s_grid + (q1[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 0x100)));
+                    const uint8_t  sb = sn1[l];
+
+                    for (j = 0; j < 4; ++j) {
+                        y[ib32 * 32 + l * 8 + j]     = db1 * (float)(int8_t)grid1[j]
+                                                     * ((sb & (1u << (j + 0))) ? -1.0f : 1.0f);
+                        y[ib32 * 32 + l * 8 + 4 + j] = db1 * (float)(int8_t)grid2[j]
+                                                     * ((sb & (1u << (j + 4))) ? -1.0f : 1.0f);
+                    }
+                }
+                for (l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = (const uint8_t *)(
+                        nita_iq3s_grid + (q2[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 0x100)));
+                    const uint8_t *grid2 = (const uint8_t *)(
+                        nita_iq3s_grid + (q2[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 0x100)));
+                    const uint8_t  sb = sn2[l];
+
+                    for (j = 0; j < 4; ++j) {
+                        y[(ib32 + 1) * 32 + l * 8 + j]     = db2 * (float)(int8_t)grid1[j]
+                                                           * ((sb & (1u << (j + 0))) ? -1.0f : 1.0f);
+                        y[(ib32 + 1) * 32 + l * 8 + 4 + j] = db2 * (float)(int8_t)grid2[j]
+                                                           * ((sb & (1u << (j + 4))) ? -1.0f : 1.0f);
+                    }
+                }
+                qh += 2;
+            }
+        }
+        return 0;
+    }
+
+    case 19: { /* IQ1_S: 256 elements, 50 bytes */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 50;
+            float          d   = rd_f16(blk);
+            const uint8_t *qs  = blk + 2;
+            const uint16_t *qh = (const uint16_t *)(blk + 34);
+            float         *y   = dst + i * 256;
+            int            ib;
+
+            for (ib = 0; ib < 8; ++ib) {
+                const uint16_t qhv   = qh[ib];
+                const float    dl    = d * (2.0f * (float)((qhv >> 12) & 7) + 1.0f);
+                const float    delta = (qhv & 0x8000u) ? -0.125f : 0.125f;
+                int            l, j;
+
+                for (l = 0; l < 4; ++l) {
+                    const int8_t *grid = (const int8_t *)(
+                        nita_iq1s_grid + (qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8)));
+
+                    for (j = 0; j < 8; ++j)
+                        y[ib * 32 + l * 8 + j] = dl * ((float)grid[j] + delta);
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 29: { /* IQ1_M: 256 elements, 56 bytes; d synthesised from scales */
+        uint64_t nb = ne0 / 256;
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 56;
+            const uint8_t *qs  = blk + 0;
+            const uint8_t *qh  = blk + 32;
+            const uint16_t *sc = (const uint16_t *)(blk + 48);
+            uint16_t       su  = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
+                                          | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+            float          d   = rd_f16((const uint8_t *)&su);
+            float         *y   = dst + i * 256;
+            int            ib;
+
+            for (ib = 0; ib < 8; ++ib) {
+                const uint16_t s   = sc[ib / 2];
+                const float    dl1 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 0)) & 7) + 1.0f);
+                const float    dl2 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 3)) & 7) + 1.0f);
+                const uint8_t  q_0 = qs[4 * ib + 0], q_1 = qs[4 * ib + 1];
+                const uint8_t  q_2 = qs[4 * ib + 2], q_3 = qs[4 * ib + 3];
+                const uint8_t  h_0 = qh[2 * ib + 0], h_1 = qh[2 * ib + 1];
+                const int      idx[4] = { q_0 | ((h_0 << 8) & 0x700), q_1 | ((h_0 << 4) & 0x700),
+                                          q_2 | ((h_1 << 8) & 0x700), q_3 | ((h_1 << 4) & 0x700) };
+                const float    del[4] = { (h_0 & 0x08) ? -0.125f : 0.125f,
+                                          (h_0 & 0x80) ? -0.125f : 0.125f,
+                                          (h_1 & 0x08) ? -0.125f : 0.125f,
+                                          (h_1 & 0x80) ? -0.125f : 0.125f };
+                const float    dl[2]  = { dl1, dl2 };
+                int            l, j;
+
+                for (l = 0; l < 4; ++l) {
+                    const int8_t *grid = (const int8_t *)(nita_iq1s_grid + idx[l]);
+                    const float   dcur = dl[l / 2];
+
+                    for (j = 0; j < 8; ++j)
+                        y[ib * 32 + l * 8 + j] = dcur * ((float)grid[j] + del[l]);
+                }
+            }
+        }
+        return 0;
+    }
+
     case 15: { /* Q8_K: 256 elements, 292 bytes */
+
         uint64_t nb = ne0 / 256;
         for (i = 0; i < nb; ++i) {
             const uint8_t *blk = src + i * 292;

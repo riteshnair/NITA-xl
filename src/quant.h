@@ -28,7 +28,8 @@
 typedef struct {
     int8_t  qs[32];
     float   d;
-    int32_t sum;
+    int32_t sum;        /* sum of qs over the whole 32-element block */
+    int32_t sums[4];    /* sum of qs over each 8-element group (IQ1_M) */
 } nita_aq8_t;
 
 /* Quantise `k` floats (k % 32 == 0) into k/32 blocks. */
