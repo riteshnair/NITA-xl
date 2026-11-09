@@ -13,9 +13,49 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ------------------------------------------------------------------
-# Target architecture – AMD Zen3 AVX2 only
+# Target architecture.
+#
+# Historically this hardcoded `-march=znver3 -mavx2`, which produced a binary
+# that faults with SIGILL on any CPU without AVX2. The code is written so all
+# AVX2 intrinsics sit behind __AVX2__ guards with scalar fallbacks, so a plain
+# x86-64 build is correct (and slower). Detection order on x86:
+#   znver3+AVX2 (Zen 3+)  ->  any -mavx2-capable target  ->  generic baseline
+# Override with -DNITA_ARCH=znver3|avx2|none (none = generic x86-64, portable).
+# Note: this is build-time selection, not runtime dispatch; an AVX2 binary
+# still faults on a pre-AVX2 CPU. Runtime dispatch remains a follow-up.
 # ------------------------------------------------------------------
-add_compile_options(-march=znver3 -mavx2)
+if(NOT NITA_ARCH)
+    set(NITA_ARCH "auto" CACHE STRING "Architecture: auto|znver3|avx2|none" FORCE)
+endif()
+include(CheckCCompilerFlag)
+set(_nita_arch_flags "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|AMD|i[3-6]86")
+    if(NITA_ARCH STREQUAL "znver3")
+        set(_nita_arch_flags "-march=znver3")
+    elseif(NITA_ARCH STREQUAL "avx2")
+        set(_nita_arch_flags "-mavx2")
+    elseif(NITA_ARCH STREQUAL "none")
+        set(_nita_arch_flags "")
+    else() # auto
+        check_c_compiler_flag("-march=znver3" _nita_znver3_ok)
+        if(_nita_znver3_ok)
+            set(_nita_arch_flags "-march=znver3")  # znver3 implies AVX2
+        else()
+            check_c_compiler_flag("-mavx2" _nita_avx2_ok)
+            if(_nita_avx2_ok)
+                set(_nita_arch_flags "-mavx2")
+            endif()
+        endif()
+    endif()
+else()
+    message(STATUS "NITA: non-x86 processor (${CMAKE_SYSTEM_PROCESSOR}); building baseline, AVX2 paths disabled")
+endif()
+if(_nita_arch_flags)
+    add_compile_options(${_nita_arch_flags})
+    message(STATUS "NITA arch flags: ${_nita_arch_flags} (set -DNITA_ARCH to override)")
+else()
+    message(STATUS "NITA arch flags: baseline (no AVX2)")
+endif()
 
 # ------------------------------------------------------------------
 # Quantisation feature toggles (CMake -D flags)
@@ -27,7 +67,7 @@ option(AWQ "Enable activation‑aware weight quantisation (selective)" OFF)
 option(BINARY_NET "Enable BitNet / binary quantisation" OFF)
 option(BF16 "Enable brain‑float16 float matmul path" OFF)
 option(FP16 "Enable IEEE float16 matmul path" OFF)
-option(MXFP8 "Enable MXFP8 (forces compile‑time error – not on AVX2)" OFF)
+option(MXFP8 "Report the MXFP8 preset label only (no kernel exists; plain Q4_K_M dot path is used)" OFF)
 option(DEBUG_BREADCRUMBS "Enable breadcrumb tracing to stderr" OFF)
 option(SHERLOCK_LITE "Enable sherlock‑lite trace to stdout" OFF)
 
@@ -108,7 +148,6 @@ add_library(nita_core STATIC
     src/transformer.c
     src/qwen35.c
     src/hadamard.c
-    src/q4_matmul.c
 )
 
 target_include_directories(nita_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -229,9 +268,10 @@ endif()
 # (PTQ1_0 against Q1_0), block count and head geometry, and a run that loads
 # both covers both without a re-configure in between. Each checkpoint's tests
 # carry its file stem, so the names stay unique and `ctest -R fork_match` still
-# selects every checkpoint's comparison. tests/kernel_test.c and
-# tests/model_test.c are left out: neither has a main(), and the first includes
-# a header the tree no longer has.
+# selects every checkpoint's comparison. tests/model_test.c and
+# tests/kernel_test.c (RED-phase scaffolds for an unbuilt placeholder
+# kernel) were removed in 2026-11; coverage of the quantised path is
+# quant_dot@<tag> and quant_tile@<tag>.
 # ------------------------------------------------------------------
 include(CTest)
 set(NITA_TEST_MODELS "" CACHE STRING

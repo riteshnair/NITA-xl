@@ -35,7 +35,9 @@
 #include <time.h>
 
 #if defined(__AVX2__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 #endif
 #if defined(_WIN32)
 #include <windows.h>
@@ -682,7 +684,8 @@ static void mv_rows(const mv_range_t *j)
 }
 
 /* Same horizontal reduction as the single-vector kernel, so the float sums
- * line up exactly rather than merely closely. */
+ * line up exactly rather than merely closely. AVX2-only helper. */
+#if defined(__AVX2__)
 static float hsum256(__m256 acc)
 {
     __m128 lo = _mm256_castps256_ps128(acc);
@@ -693,6 +696,7 @@ static float hsum256(__m256 acc)
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s);
 }
+#endif
 
 /*
  * Tile kernel: one weight row, several tokens.
@@ -1433,7 +1437,6 @@ static int matvec_tile(nita_model_t *m, const nita_tensor_t *t,
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps)
 {
     double ss = 0.0;
-    int    i;
     float  scale;
     double _t0 = prof_now();
 
@@ -1468,7 +1471,7 @@ static void rmsnorm(float *out, const float *x, const float *w, int n, float eps
         for (; i2 < n; ++i2) ss += (double)x[i2] * (double)x[i2];
     }
 #else
-    for (i = 0; i < n; ++i) ss += (double)x[i] * (double)x[i];
+    for (int i = 0; i < n; ++i) ss += (double)x[i] * (double)x[i];
 #endif
     ss /= (double)n;
     scale = 1.0f / sqrtf((float)ss + eps);
@@ -1486,7 +1489,7 @@ static void rmsnorm(float *out, const float *x, const float *w, int n, float eps
         for (; i3 < n; ++i3) out[i3] = x[i3] * scale * w[i3];
     }
 #else
-    for (i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
+    for (int i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
 #endif
     prof_add(&P_norm, prof_now() - _t0, 1);
 }

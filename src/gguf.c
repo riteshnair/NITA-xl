@@ -254,6 +254,58 @@ uint32_t ggml_blck_size(uint32_t type)
     return t ? t->block : 1;
 }
 
+/*
+ * Load-time sanity check for the whole tensor table: every tensor whose type
+ * this build knows must lie fully inside the file. Without this, a corrupt
+ * file that the model path never happens to bind (or a tool that reads only
+ * the header) would sail through, and a binding attempt or a dequant sweep
+ * over it would read out of bounds. Types this build does not know are
+ * skipped: nita_row_bytes() cannot size them, and refusing the file would
+ * brick checkpoints that are otherwise fine.
+ */
+static bool check_tensor_spans(const gguf_file_t *g, char *err, size_t errlen)
+{
+    const uint64_t data_bytes = g->file_size - g->data_offset;
+    uint64_t       i, d;
+
+    for (i = 0; i < g->tensor_count; ++i) {
+        const gguf_tensor_t *t = &g->tensors[i];
+        uint64_t             span;
+        size_t               row;
+
+        if (t->n_dims == 0 || !find_type(t->type)) continue;
+
+        if (t->offset > data_bytes) {
+            snprintf(err, errlen,
+                     "tensor '%s' starts past the end of the data section",
+                     t->name);
+            return false;
+        }
+
+        row  = nita_row_bytes(t->type, t->dims[0]);
+        span = (uint64_t)row;
+        for (d = 1; d < t->n_dims; ++d) {
+            if (t->dims[d] && span > UINT64_MAX / t->dims[d]) {
+                snprintf(err, errlen,
+                         "tensor '%s' geometry overflows 64 bits", t->name);
+                return false;
+            }
+            span *= t->dims[d];
+        }
+        if (span > data_bytes - t->offset) {
+            snprintf(err, errlen,
+                     "tensor '%s' is truncated: file gives it %llu bytes but "
+                     "ggml type %u (%s) needs %llu",
+                     t->name,
+                     (unsigned long long)(data_bytes - t->offset),
+                     t->type, ggml_type_name(t->type),
+                     (unsigned long long)span);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Value decoding                                                      */
 /* ------------------------------------------------------------------ */
@@ -273,18 +325,6 @@ static size_t type_fixed_size(uint32_t type)
         case GGUF_TYPE_FLOAT64: return 8;
         default:                return 0; /* string / array */
     }
-}
-
-/* Serialize one scalar element into out (little-endian raw bytes). */
-static bool read_scalar_raw(cursor_t *c, uint32_t type, uint8_t *out, size_t *out_len)
-{
-    size_t n = type_fixed_size(type);
-    if (n == 0) return false;
-    if (!cur_need(c, n)) return false;
-    memcpy(out, c->p + c->pos, n);
-    c->pos += n;
-    *out_len = n;
-    return true;
 }
 
 static bool read_array(cursor_t *c, gguf_kv_t *kv, char *err, size_t errlen)
@@ -595,6 +635,11 @@ gguf_file_t *gguf_load(const char *path, char *err, size_t errlen)
                  "tensor data offset %llu beyond end of file (%llu bytes)",
                  (unsigned long long)g->data_offset,
                  (unsigned long long)g->file_size);
+        gguf_free(g);
+        return NULL;
+    }
+
+    if (!check_tensor_spans(g, err, errlen)) {
         gguf_free(g);
         return NULL;
     }

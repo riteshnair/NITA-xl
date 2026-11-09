@@ -13,6 +13,11 @@
  *   • Cross-platform: Winsock on Windows, BSD sockets elsewhere.
  *   • CORS is permissive so browser clients can call the endpoint
  *     directly during development.
+ *   • POSIX SIGPIPE is ignored for the process and each client socket
+ *     carries a 30 s receive timeout, so a peer that hangs up or goes
+ *     silent cannot take the (sequential) server down or wedge it.
+ *   • Streaming responses are assembled after generation completes and
+ *     then written as SSE chunks; they are not token-incremental yet.
  */
 
 #include "nita.h"
@@ -20,6 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(_WIN32) || defined(WIN32)
+#  include <process.h>
+#else
+#  include <signal.h>
+#  include <unistd.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Platform socket layer                                               */
@@ -38,6 +50,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <arpa/inet.h>
+#  include <sys/time.h>
 #  include <unistd.h>
 #  include <errno.h>
    typedef int     sock_t;
@@ -92,7 +105,7 @@ static const char *reason_phrase(int status)
         case 415: return "Unsupported Media Type";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
-        default:  return "OK";
+        default:  return "Unknown Status";
     }
 }
 
@@ -344,7 +357,16 @@ static char *extract_content(const json_value_t *msg)
 static void new_id(char *out, size_t n)
 {
     static const char hex[] = "0123456789abcdef";
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)out;
+    static unsigned counter;
+    unsigned seed = (unsigned)time(NULL)
+#if defined(_WIN32) || defined(WIN32)
+                  ^ (unsigned)_getpid()
+#else
+                  ^ (unsigned)getpid()
+#endif
+                  ^ (unsigned)clock()
+                  ^ (counter++ * 2654435761u)
+                  ^ (unsigned)(uintptr_t)out;
     size_t i;
     size_t prefix = (size_t)snprintf(out, n, "chatcmpl-");
     for (i = prefix; i + 1 < n && i < prefix + 24; ++i) {
@@ -573,6 +595,11 @@ int http_serve(const char *host, int port, nita_server_t *srv)
     int                one = 1;
     char               hostbuf[64];
 
+#if !defined(_WIN32) && !defined(WIN32)
+    /* A peer that vanishes mid-response must not kill the server. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
     if (net_init() != 0) return 1;
 
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -629,6 +656,21 @@ int http_serve(const char *host, int port, nita_server_t *srv)
             break;
         }
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+        {
+            /* 30 s to finish sending the request; a peer that goes silent
+             * before that is dropped rather than blocking the loop forever. */
+#if defined(_WIN32) || defined(WIN32)
+            DWORD timeout_ms = 30000;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char *)&timeout_ms, sizeof timeout_ms);
+#else
+            struct timeval tv;
+            tv.tv_sec = 30;
+            tv.tv_usec = 0;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char *)&tv, sizeof tv);
+#endif
+        }
         handle_client(client, srv);
         sock_close(client);
     }

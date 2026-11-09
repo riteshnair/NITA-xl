@@ -127,17 +127,6 @@ static int32_t hsum_i32(__m256i v)
     return _mm_cvtsi128_si32(s);
 }
 
-/* sum of x[i] * w[i] over 32 signed bytes */
-static int32_t dot_i8_32(const int8_t *x, __m256i w)
-{
-    const __m256i bx = _mm256_loadu_si256((const __m256i *)x);
-    const __m256i ax = _mm256_sign_epi8(bx, bx);       /* |x|, valid operand */
-    const __m256i sw = _mm256_sign_epi8(w, bx);        /* w * sign(x)       */
-
-    return hsum_i32(_mm256_madd_epi16(_mm256_maddubs_epi16(ax, sw),
-                                      _mm256_set1_epi16(1)));
-}
-
 static float hsum256_ps(__m256 v)
 {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v),
@@ -877,7 +866,9 @@ static float dot_q8_K(const uint8_t *row, const nita_aq8_t *a, int nb)
 /* into an integer register and go straight to the vector.            */
 /* ------------------------------------------------------------------ */
 
-/* Q1_0: 8 sign bytes per stored byte, 1 for a set bit, -1 for clear */
+/* Q1_0: 8 sign bytes per stored byte, 1 for a set bit, -1 for clear.
+ * Only the scalar path calls this; the AVX2 path expands in registers. */
+#if !defined(__AVX2__)
 static const int64_t *q1_table(void)
 {
     static int64_t t[256];
@@ -897,6 +888,7 @@ static const int64_t *q1_table(void)
     }
     return t;
 }
+#endif
 
 /* Q2_0 / PQ2_0: 4 two-bit slots per stored byte, weight is slot - 1.
  * Only the scalar path needs this; the AVX2 path expands by shifting. */

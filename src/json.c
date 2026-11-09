@@ -113,7 +113,7 @@ static char *parse_string_raw(jparser_t *j, size_t *out_len)
                         cp = (cp << 4) | (unsigned)h;
                     }
                     j->p += 4;
-                    /* Surrogate pair */
+                    /* Surrogate pair; a lone surrogate becomes U+FFFD. */
                     if (cp >= 0xD800 && cp <= 0xDBFF &&
                         j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
                         unsigned lo = 0;
@@ -126,7 +126,11 @@ static char *parse_string_raw(jparser_t *j, size_t *out_len)
                         if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             j->p += 6;
+                        } else {
+                            cp = 0xFFFD;
                         }
+                    } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                        cp = 0xFFFD; /* unpaired high or low surrogate */
                     }
                     nbuf_append(&buf, enc, utf8_encode(cp, enc));
                     break;
@@ -152,25 +156,40 @@ static json_value_t *parse_number(jparser_t *j)
     size_t      n;
     json_value_t *v;
 
-    if (j->p < j->end && (*j->p == '-' || *j->p == '+')) ++j->p;
-    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+    if (j->p < j->end && *j->p == '-') ++j->p;   /* JSON has no '+' */
+    {
+        const char *dstart = j->p;
+        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+        if (j->p == dstart) { jerr(j, "bad number"); return NULL; }
+    }
     if (j->p < j->end && *j->p == '.') {
         ++j->p;
-        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+        {
+            const char *dstart = j->p;
+            while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+            if (j->p == dstart) { jerr(j, "bad number"); return NULL; }
+        }
     }
     if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
         ++j->p;
         if (j->p < j->end && (*j->p == '-' || *j->p == '+')) ++j->p;
-        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+        {
+            const char *dstart = j->p;
+            while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+            if (j->p == dstart) { jerr(j, "bad number"); return NULL; }
+        }
     }
     n = (size_t)(j->p - start);
-    if (n == 0 || n >= sizeof tmp) { jerr(j, "bad number"); return NULL; }
+    if (n >= sizeof tmp) { jerr(j, "bad number"); return NULL; }
     memcpy(tmp, start, n);
     tmp[n] = '\0';
-
-    v = jv_new(JSON_NUMBER);
-    v->u.num = strtod(tmp, NULL);
-    return v;
+    {
+        char *endp = NULL;
+        v = jv_new(JSON_NUMBER);
+        v->u.num = strtod(tmp, &endp);
+        if (!endp || *endp != '\0') { json_free(v); jerr(j, "bad number"); return NULL; }
+        return v;
+    }
 }
 
 static json_value_t *parse_array(jparser_t *j)

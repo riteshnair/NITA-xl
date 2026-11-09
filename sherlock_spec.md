@@ -1,101 +1,62 @@
-# Sherlock‑Lite Tracing & Breadcrumb Debug Tags
-**Date:** 6 Nov 2026  
+# Sherlock-Lite tracing & breadcrumbs – what is implemented (corrected 2026-11-09)
 
-## 1️⃣ Sherlock‑Lite Tracing (lightweight per‑component timing)
+> Previously this file specified a C++/`chrono`/`SHERLOCK_LITE` RAII timer with
+> "device time" and a global destructor footer. This engine is C and has no
+> device/runtime to measure; what exists is a lightweight accumulating profiler
+> printed on demand. This is how it actually works.
 
-**Stdout format (exact match to user example):**
+## 1. SHERLOCK_LITE – component timing (stdout)
 
-```
-component           ops   %dev      dev us     idle us     host us
-attention            24  95.4%   535880.80      377.62       49.20
-projections         187   3.2%    17723.32     2026.19      460.80
-recurrent            90   1.1%     6127.59     1170.02      143.80
-attention-mix         72   0.2%     1335.28     1102.27      111.60
-head+sample           1   0.0%        98.20       91.80       56.90
-bias                 18   0.0%        90.03      265.52       66.60
-transfer              1   0.0%        79.80    1087.10    1084.30
-norms                67   0.0%        72.98      784.24      139.40
-residual             48   0.0%        23.40      198.44       73.30
-ffn-activate         42   0.0%        21.52      372.84       67.70
-embed                 1   0.0%         0.48       25.44        2.40
-instrumentation floor, 256 empty ops timed through the same begin/end path: 0.70 us host, 19.54 us device each.
-```
+Compile with `-DSHERLOCK_LITE=ON` (CMake). Defined in `src/nita.h`:
 
-### Lightweight Implementation Pointers
-
-```cpp
-// Simple RAII timer (compile‑out in release builds via ‑DSHERLOCK_LITE)
-struct sherlock_timer {
-    const char* name;
-    double ops;
-    chrono::time_point<steady_clock> start, end;
-    sherlock_timer(const char* n, double o = 0) : name(n), ops(o) {
-        #ifdef SHERLOCK_LITE
-        start = steady_clock::now();
-        #endif
-    }
-    ~sherlock_timer() {
-        #ifdef SHERLOCK_LITE
-        end = steady_clock::now();
-        double host_us = duration_cast<microseconds>(end-start).count();
-        // device time queried via external marker (see below)
-        // emit line:
-        fprintf(stdout, "%-20s %-5.0f %-6.1f %-9.2f %-8.2f %-7.2f\n",
-                name, ops, 100.0*host_us/(host_us+idle_us), host_us, idle_us, host_us); 
-        // (idle_us filled by wrapper; see full driver code)
-        #endif
-    }
-};
-
-// Usage around each major kernel:
-sherlock_timer t("attention", op_count);
-do_attention(...);
-// after call, the destructor prints the line.
-```
-
-*Device‑side (`dev_us`) is captured via `llvm‑prof`‑style markers or a simple `clock_gettime` wrapper that the ORC‑lite driver already uses for kernel launches. The agent need only emit the two numbers; the exact `dev_us` calculation is abstracted by the `sherlock_timer` wrapper.*
-
-### How to Enable
-- Compile with `-DSHERLOCK_LITE`
-- Link against `libtimers` (tiny header‑only, no external dep)
-- The footer line “instrumentation floor…” is emitted once at program exit by a global destructor.
-
----
-## 2️⃣ Breadcrumb Debug Tags (very light)
-
-**Macro definition (put in a shared header):**
-
-```cpp
-#ifdef DEBUG_BREADCRUMBS
-#define __BREADCRUMB(component, phase) \
-    do { \
-        static thread_local char last_tag[64] = ""; \
-        snprintf(last_tag, sizeof(last_tag), "%s:%s", component, phase); \
-        // In a debug build you could write to a file / perfetto track; \
-        // in lightweight mode just inform: \
-        fprintf(stderr, "[BRDCRUMB] %s:%s\n", component, phase); \
-    } while(0)
+```c
+#ifdef SHERLOCK_LITE
+#  define SHERLOCK_HEADER() /* prints a header row */
+#  define SHERLOCK_ROW(component, ops, dev, dev_us, idle_us, host_us) /* prints a row */
 #else
-#define __BREADCRUMB(component, phase) ((void)0)
+#  define SHERLOCK_HEADER() ((void)0)
+#  define SHERLOCK_ROW(...) ((void)0)
 #endif
 ```
 
-**Usage throughout the driver:**
+`src/transformer.c` accumulates per-component timings into `prof_t` buckets
+(`P_embed`, `P_pq`, `P_pk`, `P_pv`, `P_norm`, `P_proj`, …) via `prof_now()` /
+`prof_add()` (wall-clock, CPU only — there is no device) and prints them with
+`--bench <n>` together with the elapsed time and the implied tok/s. With the
+flag off, every macro expands to `((void)0)` and the profiling calls compile
+out to nothing measurable.
 
-```cpp
-__BREADCRUMB("gguf_loader", "start");
-load_gguf_model(...);
-__BREADCRUMB("gguf_loader", "end");
+Example invocation (not captured output — run it for your machine):
 
-__BREADCRUMB("kv_cache", "init");
-init_kv_cache(...);
-__BREADCRUMB("kv_cache", "done");
-
-__BREADCRUMB("moe_router", "select");
-int sel = route_token(...);
-__BREADCRUMB("moe_router", "done");
+```bash
+./build/nita --model model.gguf --bench 32 --reps 5
 ```
 
-*Effect:* When `DEBUG_BREADCRUMBS` is defined (via CMake `-DDEBUG_BREADCRUMBS`), every major phase prints a tiny `stderr` line. In production builds the macro expands to `nothing`, zero overhead.
+Reported counters are wall time of CPU work broken down by phase
+(embedding / norms / projections / FFN / sampling-ish path), the number of
+operations, and the implied fraction per phase. There is **no** `dev_us`,
+`idle_us` or "instrumentation floor" line — those came from the old fictional
+document and were never produced by this codebase.
 
----
+## 2. BREADCRUMBS – debug trace (stderr)
+
+Compile with `-DDEBUG_BREADCRUMBS=ON`. `BREADCRUMB(tag, msg)` /
+`BREADCRUMBF(tag, fmt, …)` expand to a stderr line like
+
+```
+[nita gguf] tensor-table: 179 entries
+```
+
+and to `((void)0)` otherwise — zero cost in release builds, which is the only
+build type CMake produces by default (Release). These are used at load time,
+at route dispatch (`http.c`), and in the tokenizer/model paths. They are a
+diagnostic, not telemetry; nothing aggregates them.
+
+## 3. Caveats
+
+- Wall-clock only; no cycle counters, no per-thread breakdown, no file sink.
+- Numbers from `--bench` vary with machine state; the CLI prints a spread
+  warning when repeated runs differ by more than `NITA_REP_SPREAD` percent
+  (default: see README).
+- If you see `dev us` or `idle us` printed anywhere, you are looking at this
+  document's predecessor, not at the program.
