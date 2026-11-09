@@ -1102,7 +1102,7 @@ int main(int argc, char **argv)
         }
 
         SHERLOCK_HEADER();
-        SHERLOCK_ROW("model-load", (int)g->tensor_count, 100.0, 0.0, 0.0, 0.0);
+        SHERLOCK_ROW("model-load");
 
         /* Build the transformer. A metadata-only file has no usable weights,
          * in which case we say so and let the API fall back. */

@@ -40,19 +40,19 @@ typedef struct nita_model nita_model_t;
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Sherlock-lite trace – compact component table on stdout             */
+/* Sherlock-lite trace – tag lines on stdout, nothing else             */
+/* A probe exists so a later read can name where time went; it must not */
+/* carry payloads the machine never produced (the predecessor's fake    */
+/* %dev/dev_us/idle_us/host_us columns did) and must not run at all in  */
+/* a default build: with SHERLOCK_LITE off every macro expands to       */
+/* ((void)0) and the build carries zero probe code.                     */
 /* ------------------------------------------------------------------ */
 #ifdef SHERLOCK_LITE
-#  define SHERLOCK_HEADER() \
-        printf("%-14s%-8s%-10s%-12s%-12s%-10s\n", \
-               "component", "ops", "%dev", "dev_us", "idle_us", "host_us")
-#  define SHERLOCK_ROW(c, ops, dev, dev_us, idle_us, host_us) \
-        printf("%-14s%-8d%-10.1f%-12.2f%-12.2f%-10.2f\n", \
-               (c), (int)(ops), (double)(dev), (double)(dev_us), \
-               (double)(idle_us), (double)(host_us))
+#  define SHERLOCK_HEADER() ((void)0)
+#  define SHERLOCK_ROW(tag) printf("[sherlock] %s\n", (tag))
 #else
 #  define SHERLOCK_HEADER() ((void)0)
-#  define SHERLOCK_ROW(c, ops, dev, dev_us, idle_us, host_us) ((void)0)
+#  define SHERLOCK_ROW(tag) ((void)0)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -380,8 +380,11 @@ int nita_forward(nita_model_t *m, int32_t token, float *logits);
  * next-token distribution for the last token of the run. */
 int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits);
 
-/* Component profiler (transformer.c). Reset before a measured window and
- * dump afterwards; both write to stdout. */
+/* Component profiler (transformer.c). Compiles only with -DSHERLOCK_LITE:
+ * with the flag off every probe site folds to nothing and the binary
+ * carries zero instrumentation, so a plain benchmark cannot be skewed by
+ * the probe itself. Reset before a measured window and dump afterwards;
+ * both write to stdout. */
 void nita_prof_reset(void);
 void nita_prof_dump(void);
 

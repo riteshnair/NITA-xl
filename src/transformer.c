@@ -53,9 +53,11 @@ typedef long LONG;
 
 /* ------------------------------------------------------------------ */
 /* Component profiler.                                                 */
-/* nita_prof_now() costs ~100ns (QPC / CLOCK_MONOTONIC) and there are   */
-/* ~70 calls per token, so the instrumentation overhead is far below   */
-/* measurement noise here.                                             */
+/* Compiles only with SHERLOCK_LITE. With the flag off prof_now/prof_add */
+/* are empty inline functions, so every probe site folds to nothing and  */
+/* a plain benchmark measures the engine, never the probe. nita_prof_now() */
+/* costs ~100ns (QPC / CLOCK_MONOTONIC) per call, so even the lit build  */
+/* carries ~70 probes per token.                                        */
 /* ------------------------------------------------------------------ */
 typedef struct { double us; long calls; } prof_t;
 
@@ -76,6 +78,7 @@ static prof_t P_embed;   /* token embedding dequant                    */
 static prof_t P_ffnact;  /* silu * up                                  */
 static prof_t P_rope;
 
+#if defined(SHERLOCK_LITE)
 double nita_prof_now(void)
 {
 #if defined(_WIN32)
@@ -97,7 +100,14 @@ double nita_prof_now(void)
     return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;   /* fallback */
 #endif
 }
+#else
+double nita_prof_now(void)
+{
+    return 0.0;
+}
+#endif
 
+#if defined(SHERLOCK_LITE)
 static double prof_now(void)
 {
     return nita_prof_now();
@@ -108,15 +118,29 @@ static void prof_add(prof_t *p, double dt, long calls)
     p->us += dt;
     p->calls += calls;
 }
+#else
+/* Empty by design: the call folds to zero instructions, so the probe
+ * sites cost nothing in a default build. */
+static inline double prof_now(void)             { return 0.0; }
+static inline void   prof_add(prof_t *p, double dt, long calls)
+{
+    (void)p; (void)dt; (void)calls;
+}
+#endif
 
 void nita_prof_mix(int part, double us)
 {
+#if defined(SHERLOCK_LITE)
     if (part < 0 || part >= NITA_MIX_PARTS) return;
     prof_add(&P_mixp[part], us, 1);
+#else
+    (void)part; (void)us;
+#endif
 }
 
 void nita_prof_reset(void)
 {
+#if defined(SHERLOCK_LITE)
     memset(&P_proj, 0, sizeof P_proj);   memset(&P_out, 0, sizeof P_out);
     memset(&P_pq, 0, sizeof P_pq);  memset(&P_pk, 0, sizeof P_pk);
     memset(&P_pv, 0, sizeof P_pv);  memset(&P_po, 0, sizeof P_po);
@@ -127,6 +151,7 @@ void nita_prof_reset(void)
     memset(&P_norm, 0, sizeof P_norm);
     memset(&P_embed, 0, sizeof P_embed); memset(&P_ffnact, 0, sizeof P_ffnact);
     memset(&P_rope, 0, sizeof P_rope);
+#endif
 }
 
 int nita_prof_rows(nita_prof_row_t *out, int max_rows)
@@ -149,6 +174,11 @@ int nita_prof_rows(nita_prof_row_t *out, int max_rows)
     const int          n = (int)(sizeof src / sizeof src[0]);
     int                i;
 
+#if !defined(SHERLOCK_LITE)
+    (void)names; (void)subset; (void)src; (void)n;
+    (void)out; (void)max_rows; (void)i;
+    return 0;
+#else
     if (!out || max_rows <= 0) return 0;
     for (i = 0; i < n && i < max_rows; ++i) {
         out[i].name   = names[i];
@@ -157,10 +187,12 @@ int nita_prof_rows(nita_prof_row_t *out, int max_rows)
         out[i].subset = subset[i];
     }
     return i;
+#endif
 }
 
 void nita_prof_dump(void)
 {
+#if defined(SHERLOCK_LITE)
     nita_prof_row_t rows[NITA_PROF_MAX_ROWS];
     int             n = nita_prof_rows(rows, NITA_PROF_MAX_ROWS);
     double          tot = 0.0;
@@ -179,6 +211,7 @@ void nita_prof_dump(void)
     }
     printf("%-16s%8s%14.1f\n", "sum", "", tot);
     fflush(stdout);
+#endif
 }
 
 /* Which of a qwen35 block's matmuls consume a rotated activation. NULL when

@@ -401,8 +401,16 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
     if (!s || !s->buf) return -1;
 
-#define Q35_CLOCK() nita_prof_now()
-#define Q35_PHASE(part, t0) nita_prof_mix((part), Q35_CLOCK() - (t0))
+#if defined(SHERLOCK_LITE)
+#  define Q35_CLOCK() nita_prof_now()
+#  define Q35_PHASE(part, t0) nita_prof_mix((part), Q35_CLOCK() - (t0))
+#else
+/* With the flag off the probes fold to nothing, so a default build carries
+ * zero instrumentation (and cannot report a probe-skewed delta). The no-op
+ * consumes t0 so -Wunused-variable stays quiet. */
+#  define Q35_CLOCK() 0.0
+#  define Q35_PHASE(part, t0) ((void)(t0))
+#endif
     {
         double t0 = Q35_CLOCK();
 
