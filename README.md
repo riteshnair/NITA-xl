@@ -337,7 +337,7 @@ needs `-DNITA_TEST_SLOW=ON`.
 | `-DBINARY_NET=ON` | BitNet 1-bit signs |
 | `-DBF16=ON` / `-DFP16=ON` | Float matmul (scalar) |
 | `-DMXFP8=ON` | Forces a compile-time error (not on AVX2) |
-| `-DSHERLOCK_LITE=ON` | Component trace table on stdout |
+| `-DSHERLOCK_LITE=ON` | Tag lines + component timing table on stdout (zero probe code when off) |
 | `-DDEBUG_BREADCRUMBS=ON` | Breadcrumb markers on stderr |
 | `-DNITA_FORK_DIR=<dir>` | PrismML checkout with `build-mingw` (default `build/prism-llama`) |
 | `-DNITA_FORK_LOGITS=<exe>` | Use this fork driver instead of the built one |
