@@ -43,6 +43,17 @@ prints values with `%.6f`, and this report compares those printed lines (string 
 or element-wise max |Δ| parsed from the `%.6f` text). No hex-logits or full-precision
 dump flag exists, so sub-1e-6 differences are invisible by construction throughout.
 
+**Gate D — repo kernel arbiter (`tests/quant_dot_test.c`, built manually with
+`-march=znver3`; ctest is not installed in this environment).**
+
+> `--tile` (fused tile kernel vs sequential dot, per type, all rows of every quantised
+> 2-D tensor): **34/34 checkpoints, 0 over tolerance, worst rel err 0.000e+00** — the
+> tile kernels are integer-domain identical to the sequential kernels on everything the
+> checkpoints store (e.g. Tiny-Moe: 22016 dots Q4_K/Q6_K; each synthetic demo: 3840
+> dots; IQ4_XS model: 2304 dots across 3 types).
+> `--all` (integer kernel vs float reference): **22/22 synthetic demos, 0 over tolerance.**
+> `hadamard_test` PASS (0 failures), `q35_heads_test` PASS (0 failures).
+
 **Gate A — standing gate.** `--logits "hello world the a"` tiled vs
 `NITA_PREFILL_SEQ=1`, `%.6f` string equality.
 
