@@ -10,6 +10,18 @@ sees them, so ``tools/reference_forward.py`` can compute logits independently.
 
 Usage:
     python3 tools/make_tiny_model.py build/tiny.gguf [--dtype f32|q8_0]
+
+For the 256-element-block k/i-quant types, generate with the larger geometry:
+    python3 tools/make_tiny_model.py /tmp/tiny_q2k.gguf --dtype q2_k \
+        --n-embd 256 --n-ff 512 --n-head-kv 4
+so that every quantised row is a multiple of 256 elements and the kernel
+actually covers the row (smaller rows would silently process zero blocks).
+
+k/i-quant and MXFP4 encoders write random-but-legal block payloads (valid
+layouts, finite scales) rather than accurate quantisations; the demo model
+exercises the kernels for the tiled==seq gate, it is not a usable LLM. The
+.npz records the pre-quantisation source matrix for those types, not a
+dequantisation. Proper amax encoders are used for q4_0, q4_1, q8_1 and q8_k.
 """
 
 import argparse
@@ -24,7 +36,23 @@ ALIGNMENT = 32
 UINT32, INT32, FLOAT32, STRING, ARRAY = 4, 5, 6, 8, 9
 
 GGML_F32 = 0
+GGML_Q4_0 = 2
+GGML_Q4_1 = 3
 GGML_Q8_0 = 8
+GGML_Q8_1 = 9
+GGML_Q2_K = 10
+GGML_Q3_K = 11
+GGML_Q5_K = 13
+GGML_Q8_K = 15
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
+GGML_MXFP4 = 39
 GGML_Q1_0 = 41
 GGML_Q2_0 = 42
 GGML_PQ2_0 = 142
@@ -39,7 +67,7 @@ VOCAB = [
     ".", "!", "\u2581ok", "\u2581fine",
 ]
 
-# Hyperparameters
+# Hyperparameters (defaults; --n-embd/--n-ff/--n-head-kv override in main)
 N_EMBD = 128
 N_LAYER = 2
 N_HEAD = 4
@@ -52,6 +80,17 @@ KV_DIM = HEAD_DIM * N_HEAD_KV        # 64
 N_ROT = HEAD_DIM
 RMS_EPS = 1e-5
 ROPE_THETA = 10000.0
+
+
+def configure(n_embd, n_ff, n_head_kv):
+    """Override the geometry globals; must run before build()/kv emission."""
+    global N_EMBD, N_FF, N_HEAD_KV, HEAD_DIM, KV_DIM, N_ROT
+    N_EMBD = n_embd
+    N_FF = n_ff
+    N_HEAD_KV = n_head_kv
+    HEAD_DIM = N_EMBD // N_HEAD
+    KV_DIM = HEAD_DIM * N_HEAD_KV
+    N_ROT = HEAD_DIM
 
 
 def gstr(t: str) -> bytes:
@@ -375,6 +414,294 @@ def dequantise_tq2_0(data: bytes, n_elements: int) -> np.ndarray:
     return out
 
 
+
+"""Random-but-legal payload encoders for the demo k/i-quant models.
+
+A block is *legal* when the loader can decode it and the dot kernels run:
+layouts and sizes match upstream, fp16/q4k scale bytes decode to finite
+values, and grid indices stay inside their tables by construction (any byte
+value is a legal index into a 256-entry table). Weight magnitudes are
+irrelevant for the tiled==seq gate, so payloads are random rather than
+accurate. Scales are fixed small constants so decodes stay finite.
+"""
+
+_RNG = np.random.default_rng(20261110)
+
+
+def _f16(x):
+    return np.float16(x).tobytes()
+
+
+def _rand_bytes(n):
+    return _RNG.integers(0, 256, size=n, dtype=np.uint8).tobytes()
+
+
+def quantise_q2_k(mat, n_elements):
+    """Q2_K: 84 bytes / 256 weights. Random scales+qs, finite fp16 d/dmin."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for _ in range(flat.size // 256):
+        out += _rand_bytes(16)          # scales: low nibble sc, high nibble mn
+        out += _rand_bytes(64)          # qs: 2-bit at shift 0/2/4/6
+        out += _f16(0.02)               # d
+        out += _f16(0.01)               # dmin
+    return bytes(out)
+
+
+def quantise_q3_k(mat, n_elements):
+    """Q3_K: 110 bytes / 256 weights. Random hmask/qs/packed scales, finite d."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for _ in range(flat.size // 256):
+        out += _rand_bytes(32)          # hmask
+        out += _rand_bytes(64)          # qs
+        out += _rand_bytes(12)          # packed scales (q3k_scales decode)
+        out += _f16(0.02)               # d
+    return bytes(out)
+
+
+def quantise_q5_k(mat, n_elements):
+    """Q5_K: 176 bytes / 256 weights. Random qh/ql/packed scales, finite d/dmin."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for _ in range(flat.size // 256):
+        out += _f16(0.02)               # d
+        out += _f16(0.01)               # dmin
+        out += _rand_bytes(12)          # packed scales (q4k_scales decode)
+        out += _rand_bytes(32)          # qh
+        out += _rand_bytes(128)         # ql
+    return bytes(out)
+
+
+def quantise_q8_k(mat, n_elements):
+    """Q8_K: 292 bytes / 256 weights. Proper amax int8 encoding."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for start in range(0, flat.size, 256):
+        blk = flat[start:start + 256]
+        amax = float(np.max(np.abs(blk))) if blk.size else 0.0
+        d = amax / 127.0 if amax > 0 else 0.0
+        inv = 127.0 / amax if amax > 0 else 0.0
+        q = np.clip(np.round(blk.astype(np.float64) * inv), -127, 127).astype(np.int8)
+        out += np.float32(d).tobytes()
+        out += q.tobytes()
+        out += b"\x00" * 32             # bsums (unused by the kernel)
+    return bytes(out)
+
+
+def dequantise_q8_k(data, n_elements):
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 256):
+        base = b * 292
+        d = float(np.frombuffer(data[base:base + 4], dtype=np.float32)[0])
+        q = np.frombuffer(data[base + 4:base + 260], dtype=np.int8).astype(np.float32)
+        out[b * 256:(b + 1) * 256] = q * d
+    return out
+
+
+def quantise_q4_0(mat, n_elements):
+    """Q4_0: 18 bytes / 32 weights. Proper amax (value = d * (q - 8))."""
+    flat = mat.reshape(-1)
+    assert flat.size % 32 == 0
+    out = bytearray()
+    for start in range(0, flat.size, 32):
+        blk = flat[start:start + 32]
+        amax = float(np.max(np.abs(blk))) if blk.size else 0.0
+        d = amax / 7.0 if amax > 0 else 0.0
+        inv = 1.0 / d if d > 0 else 0.0
+        q = np.clip(np.rint(blk.astype(np.float64) * inv) + 8, 0, 15).astype(np.uint8)
+        out += _f16(d)
+        packed = np.zeros(16, dtype=np.uint8)
+        packed[:16] = (q[:16] | (q[16:] << 4))
+        out += packed.tobytes()
+    return bytes(out)
+
+
+def dequantise_q4_0(data, n_elements):
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 32):
+        base = b * 18
+        d = float(np.frombuffer(data[base:base + 2], dtype=np.float16)[0])
+        qs = data[base + 2:base + 18]
+        for l in range(16):
+            out[b * 32 + l] = (float(qs[l] & 0x0F) - 8.0) * d
+            out[b * 32 + 16 + l] = (float(qs[l] >> 4) - 8.0) * d
+    return out
+
+
+def quantise_q4_1(mat, n_elements):
+    """Q4_1: 20 bytes / 32 weights. Proper min-fit (value = d * q + m)."""
+    flat = mat.reshape(-1)
+    assert flat.size % 32 == 0
+    out = bytearray()
+    for start in range(0, flat.size, 32):
+        blk = flat[start:start + 32]
+        bmax = float(np.max(blk)) if blk.size else 0.0
+        bmin = float(np.min(blk)) if blk.size else 0.0
+        d = (bmax - bmin) / 15.0 if bmax > bmin else 0.0
+        m = bmin if d > 0 else 0.0
+        inv = 1.0 / d if d > 0 else 0.0
+        q = np.clip(np.rint((blk.astype(np.float64) - m) * inv), 0, 15).astype(np.uint8)
+        out += _f16(d)
+        out += _f16(m)
+        packed = np.zeros(16, dtype=np.uint8)
+        packed = (q[:16] | (q[16:] << 4))
+        out += packed.tobytes()
+    return bytes(out)
+
+
+def dequantise_q4_1(data, n_elements):
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 32):
+        base = b * 20
+        d = float(np.frombuffer(data[base:base + 2], dtype=np.float16)[0])
+        m = float(np.frombuffer(data[base + 2:base + 4], dtype=np.float16)[0])
+        qs = data[base + 4:base + 20]
+        for l in range(16):
+            out[b * 32 + l] = float(qs[l] & 0x0F) * d + m
+            out[b * 32 + 16 + l] = float(qs[l] >> 4) * d + m
+    return out
+
+
+def quantise_q8_1(mat, n_elements):
+    """Q8_1: 36 bytes / 32 weights. Proper amax int8; sum stored for realism."""
+    flat = mat.reshape(-1)
+    assert flat.size % 32 == 0
+    out = bytearray()
+    for start in range(0, flat.size, 32):
+        blk = flat[start:start + 32]
+        amax = float(np.max(np.abs(blk))) if blk.size else 0.0
+        d = amax / 127.0 if amax > 0 else 0.0
+        inv = 127.0 / amax if amax > 0 else 0.0
+        q = np.clip(np.round(blk.astype(np.float64) * inv), -127, 127).astype(np.int8)
+        out += _f16(d)
+        out += _f16(0.0)                # s field: unused by the kernel
+        out += q.tobytes()
+    return bytes(out)
+
+
+def dequantise_q8_1(data, n_elements):
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 32):
+        base = b * 36
+        d = float(np.frombuffer(data[base:base + 2], dtype=np.float16)[0])
+        q = np.frombuffer(data[base + 4:base + 36], dtype=np.int8).astype(np.float32)
+        out[b * 32:(b + 1) * 32] = q * d
+    return out
+
+
+def _iq_random(mat, n_elements, block_bytes, fixed_prefix=None):
+    """Shared helper for the i-quant family: random payload, finite fp16 d."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for _ in range(flat.size // 256):
+        if fixed_prefix:
+            out += fixed_prefix()
+        else:
+            out += _f16(0.02)           # d
+        out += _rand_bytes(block_bytes - 2)
+    return bytes(out)
+
+
+def quantise_iq2_xxs(mat, n_elements):
+    """IQ2_XXS: 66 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 66)
+
+
+def quantise_iq2_xs(mat, n_elements):
+    """IQ2_XS: 74 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 74)
+
+
+def quantise_iq3_xxs(mat, n_elements):
+    """IQ3_XXS: 98 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 98)
+
+
+def quantise_iq1_s(mat, n_elements):
+    """IQ1_S: 50 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 50)
+
+
+def quantise_iq3_s(mat, n_elements):
+    """IQ3_S: 110 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 110)
+
+
+def quantise_iq2_s(mat, n_elements):
+    """IQ2_S: 82 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 82)
+
+
+def quantise_iq4_xs(mat, n_elements):
+    """IQ4_XS: 136 bytes / 256 weights."""
+    return _iq_random(mat, n_elements, 136)
+
+
+def quantise_iq1_m(mat, n_elements):
+    """IQ1_M: 56 bytes / 256 weights, d is synthesised from 12 bits spread over
+    the four scale u16s; the pattern 0x2E66 (~0.1) is forced finite there."""
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0
+    out = bytearray()
+    for _ in range(flat.size // 256):
+        out += _rand_bytes(32)          # qs grid indices
+        out += _rand_bytes(16)          # qh grid/delta bits
+        r = _RNG.integers(0, 4096, size=4, dtype=np.uint16)
+        sc = [0x6000 | r[0],
+              ((0x60 | (_RNG.integers(0, 16))) << 8) | _RNG.integers(0, 256),
+              0xE000 | r[2],
+              0x2000 | r[3]]
+        out += b"".join(np.uint16(s).tobytes() for s in sc)
+    return bytes(out)
+
+
+_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.int32)
+
+
+def quantise_mxfp4(mat, n_elements):
+    """MXFP4: 17 bytes / 32 weights, per-block E8M0 exponent, doubled e2m1 codes."""
+    flat = mat.reshape(-1)
+    assert flat.size % 32 == 0
+    out = bytearray()
+    for start in range(0, flat.size, 32):
+        blk = flat[start:start + 32]
+        amax = float(np.max(np.abs(blk))) if blk.size else 0.0
+        if amax <= 0.0:
+            e = 0
+        else:
+            e = int(np.floor(np.log2(amax))) + 128
+            e = max(1, min(254, e))
+        d = 2.0 ** (e - 128)
+        q = np.empty(32, dtype=np.uint8)
+        for j, w in enumerate(blk):
+            tgt = w / d
+            q[j] = int(np.argmin(np.abs(_FP4.astype(np.float64) - tgt)))
+        out += bytes([e])
+        packed = np.zeros(16, dtype=np.uint8)
+        packed[:16] = (q[:16] | (q[16:] << 4))
+        out += packed.tobytes()
+    return bytes(out)
+
+
+def dequantise_mxfp4(data, n_elements):
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 32):
+        base = b * 17
+        e = data[base]
+        d = float(2.0 ** (e - 128))
+        qs = data[base + 1:base + 17]
+        for l in range(16):
+            out[b * 32 + l] = float(_FP4[qs[l] & 0x0F]) * d
+            out[b * 32 + 16 + l] = float(_FP4[qs[l] >> 4]) * d
+    return out
+
+
 def build(dtype: str):
     rng = np.random.default_rng(20261106)
     scale = 0.08
@@ -413,11 +740,20 @@ def build(dtype: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out", nargs="?", default="tiny.gguf")
-    ap.add_argument("--dtype", choices=["f32", "q8_0", "q1_0", "q2_0", "pq2_0",
+    ap.add_argument("--dtype", choices=["f32", "q8_0", "q4_0", "q4_1", "q8_1",
+                                        "q2_k", "q3_k", "q5_k", "q8_k",
+                                        "iq2_xxs", "iq2_xs", "iq3_xxs",
+                                        "iq1_s", "iq3_s", "iq2_s", "iq4_xs", "iq1_m",
+                                        "mxfp4",
+                                        "q1_0", "q2_0", "pq2_0",
                                         "ptq1_0", "tq1_0", "tq2_0"],
                     default="f32")
+    ap.add_argument("--n-embd", type=int, default=N_EMBD)
+    ap.add_argument("--n-ff", type=int, default=N_FF)
+    ap.add_argument("--n-head-kv", type=int, default=N_HEAD_KV)
     args = ap.parse_args()
 
+    configure(args.n_embd, args.n_ff, args.n_head_kv)
     weights = build(args.dtype)
 
     # Serialise tensors with 32-byte alignment.
@@ -432,10 +768,61 @@ def main():
         dims = [ne0, ne1] if mat.ndim == 2 else [ne0]
         ne0_pad = ne0
 
+        # k/i-quant family requires every row to be a multiple of 256
+        kq_ok = ne0_pad % 256 == 0
+        # i-quant random payloads: legal decode, source recorded as effective
+        iq_random = {
+            "iq2_xxs": (quantise_iq2_xxs, GGML_IQ2_XXS),
+            "iq2_xs":  (quantise_iq2_xs,  GGML_IQ2_XS),
+            "iq3_xxs": (quantise_iq3_xxs, GGML_IQ3_XXS),
+            "iq1_s":   (quantise_iq1_s,   GGML_IQ1_S),
+            "iq3_s":   (quantise_iq3_s,   GGML_IQ3_S),
+            "iq2_s":   (quantise_iq2_s,   GGML_IQ2_S),
+            "iq4_xs":  (quantise_iq4_xs,  GGML_IQ4_XS),
+            "iq1_m":   (quantise_iq1_m,   GGML_IQ1_M),
+        }
+
         if args.dtype == "q8_0" and ne0_pad % 32 == 0 and ne1 > 1:
             data = quantise_q8_0(mat)
             ttype = GGML_Q8_0
             effective[name] = dequantise_q8_0(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "q4_0" and ne0_pad % 32 == 0 and ne1 > 1:
+            data = quantise_q4_0(mat, mat.size)
+            ttype = GGML_Q4_0
+            effective[name] = dequantise_q4_0(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "q4_1" and ne0_pad % 32 == 0 and ne1 > 1:
+            data = quantise_q4_1(mat, mat.size)
+            ttype = GGML_Q4_1
+            effective[name] = dequantise_q4_1(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "q8_1" and ne0_pad % 32 == 0 and ne1 > 1:
+            data = quantise_q8_1(mat, mat.size)
+            ttype = GGML_Q8_1
+            effective[name] = dequantise_q8_1(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "q2_k" and kq_ok and ne1 > 1:
+            data = quantise_q2_k(mat, mat.size)
+            ttype = GGML_Q2_K
+            effective[name] = mat.astype(np.float32)
+        elif args.dtype == "q3_k" and kq_ok and ne1 > 1:
+            data = quantise_q3_k(mat, mat.size)
+            ttype = GGML_Q3_K
+            effective[name] = mat.astype(np.float32)
+        elif args.dtype == "q5_k" and kq_ok and ne1 > 1:
+            data = quantise_q5_k(mat, mat.size)
+            ttype = GGML_Q5_K
+            effective[name] = mat.astype(np.float32)
+        elif args.dtype == "q8_k" and kq_ok and ne1 > 1:
+            data = quantise_q8_k(mat, mat.size)
+            ttype = GGML_Q8_K
+            effective[name] = dequantise_q8_k(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "mxfp4" and ne0_pad % 32 == 0 and ne1 > 1:
+            data = quantise_mxfp4(mat, mat.size)
+            ttype = GGML_MXFP4
+            effective[name] = dequantise_mxfp4(data, mat.size).reshape(mat.shape)
+        elif args.dtype in iq_random and kq_ok and ne1 > 1:
+            enc, gt = iq_random[args.dtype]
+            data = enc(mat, mat.size)
+            ttype = gt
+            effective[name] = mat.astype(np.float32)
         elif args.dtype == "q1_0" and ne0_pad % 128 == 0:
             data = quantise_q1_0(mat)
             ttype = GGML_Q1_0
