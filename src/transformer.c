@@ -3627,9 +3627,12 @@ static void prefill_free(nita_model_t *m)
  * decodes never allocates it. A failure is remembered as tile = -1 so a doomed
  * allocation is not retried on every prompt.
  *
- * Eight is the measured default: a tile of 16 is no faster at 32 tokens and
- * loses at 64 and beyond, because the attention pass inside a tile costs
- * O(tile * position) while the projection win is already fully amortised.
+ * Sixty-four is the measured default on the one-core Xeon + Tiny-Moe
+ * (Q4_K_M): 128 tok 10.4 -> 9.5 ms/tok, 1024 tok 12.05 -> 10.79 ms/tok
+ * (+12%), 2048 tok 17.53 -> 16.36 ms/tok (+7%), so the earlier "tile 16 loses
+ * at 64+" claim does not reproduce on this model. Attention cost grows with
+ * position and very long prompts or much larger models may still prefer less;
+ * NITA_TILE overrides the default and remains capped at 64.
  */
 static int prefill_alloc(nita_model_t *m)
 {
@@ -3640,7 +3643,7 @@ static int prefill_alloc(nita_model_t *m)
     if (m->tile < 0) return -1;
 
     e = getenv("NITA_TILE");
-    t = e ? atoi(e) : 8;
+    t = e ? atoi(e) : 64;
     if (t < 1)  t = 1;
     if (t > 64) t = 64;
 
