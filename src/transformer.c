@@ -766,6 +766,38 @@ static void mv_rows_tile(const mv_range_t *j);
 static void attention_rows(nita_model_t *m, int layer, int pos0, int lo, int hi);
 
 /* y[lo..hi) = W[lo..hi) . x */
+
+/* AVX2 float dot for the generic path (F16/F32/BF16 weights): four
+ * accumulators, eight floats each, fixed reduction tree. Both the sequential
+ * (mv_rows) and tile (mv_rows_tile) tails call it, so the two stay
+ * bit-identical. Documented float-order change vs the old scalar loop -
+ * measured in the commit message, not claimed away. */
+#if defined(__AVX2__)
+static float fdot_avx2(const float *a, const float *b, uint64_t n)
+{
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    uint64_t i = 0;
+
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    }
+    for (; i + 8 <= n; i += 8)
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    acc0 = _mm256_hadd_ps(acc0, acc0);
+    acc0 = _mm256_hadd_ps(acc0, acc0);
+    {
+        float sum = _mm_cvtss_f32(_mm256_castps256_ps128(acc0));
+        for (; i < n; ++i) sum += a[i] * b[i];
+        return sum;
+    }
+}
+#endif
+
 static void mv_rows(const mv_range_t *j)
 {
     const nita_tensor_t *t = j->t;
@@ -833,7 +865,11 @@ static void mv_rows(const mv_range_t *j)
             j->y[r] = 0.0f;
             continue;
         }
+#if defined(__AVX2__)
+        sum = fdot_avx2(j->rowbuf, j->x, t->ne0);
+#else
         for (i = 0; i < t->ne0; ++i) sum += j->rowbuf[i] * j->x[i];
+#endif
         j->y[r] = sum;
     }
 }
@@ -990,12 +1026,17 @@ static void mv_rows_tile(const mv_range_t *j)
             continue;
         }
         for (i = 0; i < T; ++i) {
+#if defined(__AVX2__)
+            j->y[(size_t)i * (size_t)N + r] =
+                fdot_avx2(j->rowbuf, j->x + (size_t)i * (size_t)K, t->ne0);
+#else
             const float *xi = j->x + (size_t)i * (size_t)K;
             float        sum = 0.0f;
             uint64_t     k;
 
             for (k = 0; k < t->ne0; ++k) sum += j->rowbuf[k] * xi[k];
             j->y[(size_t)i * (size_t)N + r] = sum;
+#endif
         }
     }
 }

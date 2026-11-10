@@ -2754,19 +2754,1309 @@ static void dot_tile_q5_1(const uint8_t *row, const nita_aq8_t *a, int stride,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Additional tile kernels. Every previously unfused type gets a tile   */
+/* form that expands each weight block once and applies it to up to    */
+/* eight tokens. Integer accumulation is order-free, and each token's   */
+/* float terms are produced in the per-token kernel's order; the       */
+/* horizontal reduction trees and the attention slab differ from the    */
+/* sequential path, so tiled == seq is only approximate at full        */
+/* precision. Verified equal at the repo's standing %.6f --logits gate; */
+/* see tile_kernels_verification.md for the full matrix and the         */
+/* known pre-existing tiled-vs-seq gap (attention).                     */
+/* ------------------------------------------------------------------ */
+
+static void dot_tile_q4_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, b, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (b = 0; b < nb; ++b) {
+            const uint8_t *blk = row + (size_t)b * 18;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const __m256i  w   = _mm256_sub_epi8(nibbles_32(blk + 2),
+                                                 _mm256_set1_epi8(8));
+
+            for (i = 0; i < tc; ++i) {
+                const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + b];
+
+                vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ai->qs, w),
+                                          _mm256_set1_ps(dw * ai->d), vacc[i]);
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q4_0(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q4_1: single accumulator plus the min-correction through activation sums */
+static void dot_tile_q4_1(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, b, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+        float     corr[8];
+
+        for (i = 0; i < tc; ++i) {
+            vacc[i] = _mm256_setzero_ps();
+            corr[i] = 0.0f;
+        }
+
+        for (b = 0; b < nb; ++b) {
+            const uint8_t *blk = row + (size_t)b * 20;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            float          mw  = nita_f16_to_f32((uint16_t)(blk[2] | (blk[3] << 8)));
+            const __m256i  w   = nibbles_32(blk + 4);
+
+            for (i = 0; i < tc; ++i) {
+                const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + b];
+                float            dx  = ai->d;
+
+                vacc[i] = _mm256_fmadd_ps(dot_u8_vec(ai->qs, w),
+                                          _mm256_set1_ps(dw * dx), vacc[i]);
+                corr[i] += mw * dx * (float)ai->sum;
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]) + corr[i];
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q4_1(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_q8_1(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, b, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (b = 0; b < nb; ++b) {
+            const uint8_t *blk = row + (size_t)b * 36;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const __m256i  w   = _mm256_loadu_si256((const __m256i *)(blk + 4));
+
+            for (i = 0; i < tc; ++i) {
+                const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + b];
+
+                vacc[i] = _mm256_fmadd_ps(dot_i8_vec_exact(ai->qs, w),
+                                          _mm256_set1_ps(dw * ai->d), vacc[i]);
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q8_1(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q2_K: the 16-element halves carry their own scale and min, so the
+ * accumulator stays a __m128 of four int32 lanes per token. */
+static void dot_tile_q2_K(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, sb, chunk, i0;
+
+#if defined(__AVX2__)
+    {
+        const __m256i m3    = _mm256_set1_epi8(0x03);
+        const __m128i ones  = _mm_set1_epi8(1);
+        const __m128i onesw = _mm_set1_epi16(1);
+
+        for (i0 = 0; i0 < t; i0 += 8) {
+            const int tc = (t - i0) < 8 ? (t - i0) : 8;
+            __m128    vacc[8];
+
+            for (i = 0; i < tc; ++i) vacc[i] = _mm_setzero_ps();
+
+            for (sb = 0; sb < nb / 8; ++sb) {
+                const uint8_t *blk  = row + (size_t)sb * 84;
+                const uint8_t *qs   = blk + 16;
+                float d    = nita_f16_to_f32((uint16_t)(blk[80] | (blk[81] << 8)));
+                float dmin = nita_f16_to_f32((uint16_t)(blk[82] | (blk[83] << 8)));
+                int   is   = 0;
+
+                for (chunk = 0; chunk < 2; ++chunk) {
+                    const __m256i q2v = _mm256_loadu_si256((const __m256i *)qs);
+                    int shift = 0, j;
+
+                    for (j = 0; j < 4; ++j) {
+                        const __m256i bits = _mm256_and_si256(
+                                                 _mm256_srli_epi16(q2v, shift), m3);
+                        const __m128i lo = _mm256_castsi256_si128(bits);
+                        const __m128i hi = _mm256_extracti128_si256(bits, 1);
+                        int h;
+
+                        for (h = 0; h < 2; ++h) {
+                            const int   sc  = blk[is++];
+                            const float dl  = d    * (float)(sc & 0x0F);
+                            const float ml  = dmin * (float)(sc >> 4);
+                            const __m128i hv = h ? hi : lo;
+
+                            for (i = 0; i < tc; ++i) {
+                                const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride
+                                                          + sb * 8 + chunk * 4 + j];
+                                const __m128i x16 = _mm_loadu_si128(
+                                                       (const __m128i *)(ab->qs + h * 16));
+                                __m128i p4, c4;
+
+                                p4 = _mm_madd_epi16(
+                                         _mm_maddubs_epi16(hv, x16), onesw);
+                                c4 = _mm_madd_epi16(_mm_maddubs_epi16(ones, x16), onesw);
+                                vacc[i] = _mm_fmadd_ps(_mm_cvtepi32_ps(p4),
+                                                       _mm_set1_ps(dl * ab->d), vacc[i]);
+                                vacc[i] = _mm_fmadd_ps(_mm_cvtepi32_ps(c4),
+                                                       _mm_set1_ps(-ml * ab->d), vacc[i]);
+                            }
+                        }
+                        shift += 2;
+                    }
+                    qs += 32;
+                }
+            }
+            for (i = 0; i < tc; ++i)
+                out[(size_t)(i0 + i) * out_stride] = hsum128_ps(vacc[i]);
+        }
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q2_K(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q3_K: one scale per 16-element half, signed-byte weights, __m128 accumulator */
+static void dot_tile_q3_K(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, sb, chunk, i0;
+
+#if defined(__AVX2__)
+    {
+        const __m256i m3    = _mm256_set1_epi8(0x03);
+        const __m128i onesw = _mm_set1_epi16(1);
+
+        for (i0 = 0; i0 < t; i0 += 8) {
+            const int tc = (t - i0) < 8 ? (t - i0) : 8;
+            float     tot[8];
+
+            for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+            for (sb = 0; sb < nb / 8; ++sb) {
+                __m128 vacc[8];
+                const uint8_t *blk = row + (size_t)sb * 110;
+                float          d   = nita_f16_to_f32((uint16_t)(blk[108] | (blk[109] << 8)));
+                int8_t         sc[16];
+                int            is = 0;
+                uint8_t        m  = 1;
+
+                for (i = 0; i < tc; ++i) vacc[i] = _mm_setzero_ps();
+
+                q3k_scales(blk + 96, sc);
+
+                const __m256i hm = _mm256_loadu_si256((const __m256i *)blk);
+
+                for (chunk = 0; chunk < 2; ++chunk) {
+                    const __m256i q3v = _mm256_loadu_si256(
+                                            (const __m256i *)(blk + 32 + chunk * 32));
+                    int shift = 0, j;
+
+                    for (j = 0; j < 4; ++j) {
+                        const __m256i bits = _mm256_and_si256(
+                                                 _mm256_srli_epi16(q3v, shift), m3);
+                        const __m256i bit  = _mm256_set1_epi8((char)m);
+                        const __m256i clr  = _mm256_cmpeq_epi8(
+                                                 _mm256_and_si256(hm, bit),
+                                                 _mm256_setzero_si256());
+                        const __m256i w    = _mm256_sub_epi8(bits,
+                                                 _mm256_and_si256(clr,
+                                                     _mm256_set1_epi8(4)));
+                        const __m128i lo = _mm256_castsi256_si128(w);
+                        const __m128i hi = _mm256_extracti128_si256(w, 1);
+                        int h;
+
+                        for (h = 0; h < 2; ++h) {
+                            const float dl = d * (float)(sc[is] - 32);
+                            const __m128i hv = h ? hi : lo;
+
+                            is++;
+                            for (i = 0; i < tc; ++i) {
+                                const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride
+                                                          + sb * 8 + chunk * 4 + j];
+                                const __m128i x16 = _mm_loadu_si128(
+                                                       (const __m128i *)(ab->qs + h * 16));
+                                const __m128i ax  = _mm_sign_epi8(x16, x16);
+                                const __m128i sw  = _mm_sign_epi8(hv, x16);
+                                const __m128i p4  = _mm_madd_epi16(
+                                                        _mm_maddubs_epi16(ax, sw), onesw);
+
+                                vacc[i] = _mm_fmadd_ps(_mm_cvtepi32_ps(p4),
+                                                       _mm_set1_ps(dl * ab->d), vacc[i]);
+                            }
+                        }
+                        shift += 2;
+                        m = (uint8_t)(m << 1);
+                    }
+                }
+                for (i = 0; i < tc; ++i)
+                    tot[i] += hsum128_ps(vacc[i]);
+            }
+            for (i = 0; i < tc; ++i)
+                out[(size_t)(i0 + i) * out_stride] = tot[i];
+        }
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q3_K(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q5_K: min rides the activation sums, so keep per-token float sums in the
+ * same order the per-token kernel uses. */
+static void dot_tile_q5_K(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, sb, j, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk  = row + (size_t)sb * 176;
+            const uint8_t *qh   = blk + 16;
+            const uint8_t *ql   = blk + 48;
+            float          d    = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            float          dmin = nita_f16_to_f32((uint16_t)(blk[2] | (blk[3] << 8)));
+            int8_t         sc[8], mn[8];
+
+            q4k_scales(blk + 4, sc, mn);
+
+            for (j = 0; j < 4; ++j) {
+                const float   d0  = d    * (float)sc[2 * j + 0];
+                const float   m0  = dmin * (float)mn[2 * j + 0];
+                const float   d1  = d    * (float)sc[2 * j + 1];
+                const float   m1  = dmin * (float)mn[2 * j + 1];
+                const __m256i qlv = _mm256_loadu_si256(
+                                        (const __m256i *)(ql + j * 32));
+                const __m256i qhv = _mm256_loadu_si256(
+                                        (const __m256i *)(qh));
+                const __m256i m0f = _mm256_set1_epi8(0x0F);
+                const __m256i bit0 = _mm256_set1_epi8((char)(1 << (2 * j)));
+                const __m256i bit1 = _mm256_set1_epi8((char)(2 << (2 * j)));
+                const __m256i h16  = _mm256_set1_epi8(16);
+                const __m256i zero = _mm256_setzero_si256();
+                __m256i lo0, lo1, h0, h1, w0, w1;
+
+                lo0 = _mm256_cmpeq_epi8(_mm256_and_si256(qhv, bit0), zero);
+                lo1 = _mm256_cmpeq_epi8(_mm256_and_si256(qhv, bit1), zero);
+                h0  = _mm256_andnot_si256(lo0, h16);
+                h1  = _mm256_andnot_si256(lo1, h16);
+                w0  = _mm256_or_si256(_mm256_and_si256(qlv, m0f), h0);
+                w1  = _mm256_or_si256(
+                          _mm256_and_si256(_mm256_srli_epi16(qlv, 4), m0f), h1);
+
+                for (i = 0; i < tc; ++i) {
+                    const size_t     base = (size_t)(i0 + i) * stride + sb * 8 + 2 * j;
+                    const nita_aq8_t *a0  = &a[base];
+                    const nita_aq8_t *a1  = &a[base + 1];
+                    int32_t          s0   = dot_u8_32(a0->qs, w0);
+                    int32_t          s1   = dot_u8_32(a1->qs, w1);
+
+                    tot[i] += d0 * a0->d * (float)s0;
+                    tot[i] -= m0 * a0->d * (float)a0->sum;
+                    tot[i] += d1 * a1->d * (float)s1;
+                    tot[i] -= m1 * a1->d * (float)a1->sum;
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q5_K(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q8_K: one horizontal sum per 256-weight superblock per token, as the
+ * per-token kernel does; the block loads are shared. */
+static void dot_tile_q8_K(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, sb, j, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 292;
+            float          dw;
+
+            memcpy(&dw, blk, sizeof dw);
+
+            __m256 vacc[8];
+
+            for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+            for (j = 0; j < 8; ++j) {
+                const __m256i w = _mm256_loadu_si256(
+                                      (const __m256i *)(blk + 4 + j * 32));
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + j];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w),
+                                              _mm256_set1_ps(dw * ab->d), vacc[i]);
+                }
+            }
+            for (i = 0; i < tc; ++i)
+                tot[i] += hsum256_ps(vacc[i]);
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q8_K(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_mxfp4(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, b, i0;
+
+#if defined(__AVX2__)
+    {
+        const __m256i tbl = _mm256_broadcastsi128_si256(
+                                _mm_loadu_si128((const __m128i *)g_fp4));
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+
+        for (i0 = 0; i0 < t; i0 += 8) {
+            const int tc = (t - i0) < 8 ? (t - i0) : 8;
+            __m256    vacc[8];
+
+            for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+            for (b = 0; b < nb; ++b) {
+                const uint8_t *blk = row + (size_t)b * 17;
+                float          d   = e8m0_half(blk[0]);
+                const __m128i  q   = _mm_loadu_si128((const __m128i *)(blk + 1));
+                const __m256i  nib = _mm256_set_m128i(
+                                         _mm_and_si128(_mm_srli_epi16(q, 4), m0f),
+                                         _mm_and_si128(q, m0f));
+                const __m256i  w8  = _mm256_shuffle_epi8(tbl, nib);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ai = &a[(size_t)(i0 + i) * stride + b];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ai->qs, w8),
+                                              _mm256_set1_ps(d * ai->d), vacc[i]);
+                }
+            }
+            for (i = 0; i < tc; ++i)
+                out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+        }
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_mxfp4(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_iq4_xs(const uint8_t *row, const nita_aq8_t *a, int stride,
+                            int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib, i0;
+
+#if defined(__AVX2__)
+    {
+        const __m256i tbl = _mm256_broadcastsi128_si256(
+                                _mm_loadu_si128((const __m128i *)g_iq4nl));
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+
+        for (i0 = 0; i0 < t; i0 += 8) {
+            const int tc = (t - i0) < 8 ? (t - i0) : 8;
+            __m256    vacc[8];
+
+            for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+            for (sb = 0; sb < nb / 8; ++sb) {
+                const uint8_t *blk = row + (size_t)sb * 136;
+                float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+                uint16_t       h   = (uint16_t)(blk[2] | (blk[3] << 8));
+                const uint8_t *sl  = blk + 4;
+                const uint8_t *qs  = blk + 8;
+
+                for (ib = 0; ib < 8; ++ib) {
+                    int   ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                             | (((h >> (2 * ib)) & 3) << 4);
+                    float dl = d * (float)(ls - 32);
+                    const __m128i b = _mm_loadu_si128(
+                                          (const __m128i *)(qs + ib * 16));
+                    const __m256i nib = _mm256_set_m128i(
+                                            _mm_and_si128(_mm_srli_epi16(b, 4), m0f),
+                                            _mm_and_si128(b, m0f));
+                    const __m256i w8 = _mm256_shuffle_epi8(tbl, nib);
+
+                    for (i = 0; i < tc; ++i) {
+                        const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib];
+
+                        vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w8),
+                                                  _mm256_set1_ps(dl * ab->d), vacc[i]);
+                    }
+                }
+            }
+            for (i = 0; i < tc; ++i)
+                out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+        }
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_iq4_xs(row, &a[(size_t)i * stride], nb);
+}
+
+/* Q1_0: four activation-block accumulators per stored block, as in the
+ * per-token kernel; four tokens per pass keeps the tile under sixteen
+ * vector registers before temporaries. */
+static void dot_tile_q1_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, j, sb, i0;
+
+#if defined(__AVX2__)
+    {
+        const __m256i ones8  = _mm256_set1_epi8(1);
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        const __m256i m1s    = _mm256_set1_epi8((char)-1);
+
+        for (i0 = 0; i0 < t; i0 += 4) {
+            const int tc = (t - i0) < 4 ? (t - i0) : 4;
+            __m256    v[4][4];
+
+            for (i = 0; i < tc; ++i)
+                for (j = 0; j < 4; ++j) v[i][j] = _mm256_setzero_ps();
+
+            for (sb = 0; sb < nb / 4; ++sb) {
+                const uint8_t *blk = row + (size_t)sb * 18;
+                const uint8_t *qs  = blk + 2;
+                float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+
+                for (j = 0; j < 4; ++j) {
+                    const __m256i m = _mm256_xor_si256(bits_32(qs + 4 * j), m1s);
+
+                    for (i = 0; i < tc; ++i) {
+                        const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 4 + j];
+                        const __m256i q  = _mm256_loadu_si256((const __m256i *)ab->qs);
+                        const __m256i sq = _mm256_sub_epi8(_mm256_xor_si256(q, m), m);
+                        const __m256  r  = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                                              _mm256_maddubs_epi16(ones8, sq), ones16));
+
+                        v[i][j] = _mm256_fmadd_ps(r,
+                                                  _mm256_set1_ps(dw * ab->d), v[i][j]);
+                    }
+                }
+            }
+            for (i = 0; i < tc; ++i)
+                out[(size_t)(i0 + i) * out_stride] =
+                    hsum256_ps(_mm256_add_ps(_mm256_add_ps(v[i][0], v[i][1]),
+                                             _mm256_add_ps(v[i][2], v[i][3])));
+        }
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q1_0(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_q2_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                          int t, int nb, float *out, int out_stride)
+{
+    int i, j, sb, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 2; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 18;
+            const uint8_t *qs  = blk + 2;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+
+            for (j = 0; j < 2; ++j) {
+                const __m256i w = q2_expand(qs + j * 8);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 2 + j];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w),
+                                              _mm256_set1_ps(dw * ab->d), vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_q2_0(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_pq2_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, j, sb, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 4; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 34;
+            const uint8_t *qs  = blk + 2;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+
+            for (j = 0; j < 4; ++j) {
+                const __m256i w = q2_expand(qs + j * 8);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 4 + j];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w),
+                                              _mm256_set1_ps(dw * ab->d), vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_pq2_0(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_tq2_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, g, l, sb, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+        const __m256i mask = _mm256_set1_epi8(0x03);
+        const __m256i one  = _mm256_set1_epi8(1);
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 66;
+            float          dw  = nita_f16_to_f32((uint16_t)(blk[64] | (blk[65] << 8)));
+
+            for (g = 0; g < 2; ++g) {
+                const __m256i b = _mm256_loadu_si256((const __m256i *)(blk + g * 32));
+
+                for (l = 0; l < 4; ++l) {
+                    __m256i w = _mm256_srli_epi16(b, 2 * l);
+
+                    w = _mm256_and_si256(w, mask);
+                    w = _mm256_sub_epi8(w, one);
+
+                    for (i = 0; i < tc; ++i) {
+                        const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride
+                                                  + sb * 8 + g * 4 + l];
+
+                        vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w),
+                                                  _mm256_set1_ps(dw * ab->d), vacc[i]);
+                    }
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_tq2_0(row, &a[(size_t)i * stride], nb);
+}
+
+/* PTQ1_0: the base-3 plane decode is shared; only the per-token dots ride
+ * the activation loads. */
+static void dot_tile_ptq1_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                            int t, int nb, float *out, int out_stride)
+{
+    int i, sb, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 4; ++sb) {
+            const uint8_t    *blk = row + (size_t)sb * 28;
+            const uint8_t    *qs  = blk;
+            const uint8_t    *qh  = blk + 24;
+            float             dw  = nita_f16_to_f32((uint16_t)(blk[26] | (blk[27] << 8)));
+            const __m128i     three = _mm_set1_epi16(3);
+            const __m128i     ff    = _mm_set1_epi16(0xFF);
+            const __m128i     one   = _mm_set1_epi16(1);
+            __m128i           p16[5];
+            __m128i           p8[5];
+            __m128i           tail;
+            int               n;
+
+            {
+                const __m256i three2 = _mm256_set1_epi16(3);
+                const __m256i ff2    = _mm256_set1_epi16(0xFF);
+                const __m256i one2   = _mm256_set1_epi16(1);
+                __m256i       r      = _mm256_cvtepu8_epi16(
+                                           _mm_loadu_si128((const __m128i *)qs));
+
+                for (n = 0; n < 5; ++n) {
+                    const __m256i t2 = _mm256_mullo_epi16(r, three2);
+                    const __m256i d = _mm256_sub_epi16(_mm256_srli_epi16(t2, 8), one2);
+
+                    p16[n] = _mm_packs_epi16(_mm256_castsi256_si128(d),
+                                             _mm256_extracti128_si256(d, 1));
+                    r = _mm256_and_si256(t2, ff2);
+                }
+            }
+            {
+                __m128i r = _mm_cvtepu8_epi16(
+                                _mm_loadl_epi64((const __m128i *)(qs + 16)));
+
+                for (n = 0; n < 5; ++n) {
+                    const __m128i t2 = _mm_mullo_epi16(r, three);
+                    const __m128i d = _mm_sub_epi16(_mm_srli_epi16(t2, 8), one);
+
+                    p8[n] = _mm_packs_epi16(d, d);
+                    r = _mm_and_si128(t2, ff);
+                }
+            }
+            {
+                const int8_t *T  = ptq_table();
+                int8_t        t8[8];
+                int           k, m;
+
+                for (k = 0; k < 4; ++k)
+                    for (m = 0; m < 2; ++m)
+                        t8[k * 2 + m] = T[(size_t)qh[m] * 5 + k];
+                tail = _mm_loadl_epi64((const __m128i *)t8);
+            }
+
+            {
+                const __m256i w0 = _mm256_set_m128i(p16[1], p16[0]);
+                const __m256i w1 = _mm256_set_m128i(p16[3], p16[2]);
+                const __m256i w2 = _mm256_set_m128i(_mm_unpacklo_epi64(p8[0], p8[1]),
+                                                    p16[4]);
+                const __m256i w3 = _mm256_set_m128i(_mm_unpacklo_epi64(p8[4], tail),
+                                                    _mm_unpacklo_epi64(p8[2], p8[3]));
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 4];
+                    const __m256 v0 = _mm256_set1_ps(dw * ab[0].d);
+                    const __m256 v1 = _mm256_set1_ps(dw * ab[1].d);
+                    const __m256 v2 = _mm256_set1_ps(dw * ab[2].d);
+                    const __m256 v3 = _mm256_set1_ps(dw * ab[3].d);
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[0].qs, w0), v0, vacc[i]);
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[1].qs, w1), v1, vacc[i]);
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[2].qs, w2), v2, vacc[i]);
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[3].qs, w3), v3, vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_ptq1_0(row, &a[(size_t)i * stride], nb);
+}
+
+/* TQ1_0: five 32-element planes straight from registers, then the two
+ * 16-plane pairs and the tail formed by ptq_table(). */
+static void dot_tile_tq1_0(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, sb, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+        const __m256i three = _mm256_set1_epi16(3);
+        const __m256i ff    = _mm256_set1_epi16(0xFF);
+        const __m256i one8  = _mm256_set1_epi8(1);
+        const __m256i one16 = _mm256_set1_epi16(1);
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t    *blk = row + (size_t)sb * 54;
+            const uint8_t    *qs  = blk;
+            const uint8_t    *qh  = blk + 48;
+            float             dw  = nita_f16_to_f32((uint16_t)(blk[52] | (blk[53] << 8)));
+            __m256i           lo = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs));
+            __m256i           hi = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(qs + 16)));
+            __m128i           p[5];
+            int               n;
+
+            for (n = 0; n < 5; ++n) {
+                const __m256i tl = _mm256_mullo_epi16(lo, three);
+                const __m256i th = _mm256_mullo_epi16(hi, three);
+                __m256i       d;
+
+                d = _mm256_packs_epi16(_mm256_srli_epi16(tl, 8),
+                                       _mm256_srli_epi16(th, 8));
+                d = _mm256_permute4x64_epi64(d, 0xD8);
+                d = _mm256_sub_epi8(d, one8);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + n];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, d),
+                                              _mm256_set1_ps(dw * ab->d), vacc[i]);
+                }
+                lo = _mm256_and_si256(tl, ff);
+                hi = _mm256_and_si256(th, ff);
+            }
+
+            /* bytes 32..47 -> five planes of 16 */
+            {
+                __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(qs + 32)));
+
+                for (n = 0; n < 5; ++n) {
+                    const __m256i t2 = _mm256_mullo_epi16(r, three);
+                    const __m256i d = _mm256_sub_epi16(_mm256_srli_epi16(t2, 8), one16);
+                    __m128i       packed;
+
+                    packed = _mm_packs_epi16(_mm256_castsi256_si128(d),
+                                             _mm256_extracti128_si256(d, 1));
+                    p[n] = packed;
+                    r = _mm256_and_si256(t2, ff);
+                }
+            }
+
+            {
+                const __m256i w5 = _mm256_set_m128i(p[1], p[0]);
+                const __m256i w6 = _mm256_set_m128i(p[3], p[2]);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + 5];
+                    const __m256i     w5c = w5;
+                    const __m256i     w6c = w6;
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[0].qs, w5c),
+                                              _mm256_set1_ps(dw * ab[0].d), vacc[i]);
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab[1].qs, w6c),
+                                              _mm256_set1_ps(dw * ab[1].d), vacc[i]);
+                }
+            }
+
+            /* chunk 7: fifth 16-plane, then the four qh bytes */
+            {
+                const int8_t *T = ptq_table();
+                int8_t        tail[16];
+                int           k, m;
+
+                for (k = 0; k < 4; ++k)
+                    for (m = 0; m < 4; ++m)
+                        tail[k * 4 + m] = T[(size_t)qh[m] * 5 + k];
+
+                const __m256i w7 = _mm256_set_m128i(
+                                       _mm_loadu_si128((const __m128i *)tail), p[4]);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + 7];
+
+                    vacc[i] = _mm256_fmadd_ps(dot_i8_vec(ab->qs, w7),
+                                              _mm256_set1_ps(dw * ab->d), vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_tq1_0(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_iq2_xxs(const uint8_t *row, const nita_aq8_t *a, int stride,
+                             int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib32, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 66;
+            float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t *qsb = blk + 2;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                uint32_t       aux0, aux1;
+                float          db;
+                const uint8_t *gi;
+                int8_t         w8[32];
+                int            l;
+
+                memcpy(&aux0, qsb + 8 * ib32, sizeof aux0);
+                memcpy(&aux1, qsb + 8 * ib32 + 4, sizeof aux1);
+                db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                gi = (const uint8_t *)&aux0;
+
+                for (l = 0; l < 4; ++l)
+                    iq_grid8(nita_iq2xxs_grid, gi[l],
+                             nita_ksigns64[(aux1 >> 7 * l) & 127], w8 + 8 * l);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32];
+
+                    vacc[i] = _mm256_fmadd_ps(iq_dot32(ab->qs, w8),
+                                              _mm256_set1_ps(db * ab->d), vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_iq2_xxs(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_iq2_xs(const uint8_t *row, const nita_aq8_t *a, int stride,
+                            int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib32, i0;
+
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 74;
+            float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint16_t *qs = (const uint16_t *)(blk + 2);
+            const uint8_t *sc  = blk + 66;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                const uint8_t s    = sc[ib32];
+                const float   db0  = d * (0.5f + (float)(s & 0x0F)) * 0.25f;
+                const float   db1  = d * (0.5f + (float)(s >> 4)) * 0.25f;
+                int8_t        w8[32];
+                int           l;
+
+                for (l = 0; l < 4; ++l) {
+                    const uint16_t q = qs[4 * ib32 + l];
+
+                    iq_grid8(nita_iq2xs_grid, (int)(q & 511),
+                             nita_ksigns64[q >> 9], w8 + 8 * l);
+                }
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32];
+#if defined(__AVX2__)
+                    const int lo = iq_dot16(ab->qs, w8);
+                    const int hi = iq_dot16(ab->qs + 16, w8 + 16);
+#else
+                    int32_t s0 = 0, s1 = 0, j;
+
+                    for (j = 0; j < 16; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                    for (j = 0; j < 16; ++j) s1 += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                    const int lo = s0, hi = s1;
+#endif
+                    tot[i] += ab->d * (db0 * (float)lo + db1 * (float)hi);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+}
+
+static void dot_tile_iq2_s(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib32, i0;
+
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 82;
+            float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t  *qs = blk + 2;
+            const uint8_t  *qh = blk + 66;
+            const uint8_t  *signs = qs + 32;
+            const uint8_t  *sc  = blk + 74;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                const uint8_t s    = sc[ib32];
+                const float   db0  = d * (0.5f + (float)(s & 0x0F)) * 0.25f;
+                const float   db1  = d * (0.5f + (float)(s >> 4)) * 0.25f;
+                int8_t        w8[32];
+                int           l;
+
+                for (l = 0; l < 4; ++l) {
+                    const int idx = qs[4 * ib32 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+
+                    iq_grid8(nita_iq2s_grid, idx,
+                             nita_signmask64[signs[4 * ib32 + l]], w8 + 8 * l);
+                }
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32];
+#if defined(__AVX2__)
+                    const int lo = iq_dot16(ab->qs, w8);
+                    const int hi = iq_dot16(ab->qs + 16, w8 + 16);
+#else
+                    int32_t s0 = 0, s1 = 0, j;
+
+                    for (j = 0; j < 16; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                    for (j = 0; j < 16; ++j) s1 += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                    const int lo = s0, hi = s1;
+#endif
+                    tot[i] += ab->d * (db0 * (float)lo + db1 * (float)hi);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+}
+
+static void dot_tile_iq3_xxs(const uint8_t *row, const nita_aq8_t *a, int stride,
+                             int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib32, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 98;
+            float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t *qs  = blk + 2;
+            const uint8_t *scales_and_signs = qs + 64;
+
+            for (ib32 = 0; ib32 < 8; ++ib32) {
+                uint32_t       aux32;
+                float          db;
+                const uint8_t *q   = qs + 8 * ib32;
+                int8_t         w8[32];
+                int            l;
+
+                memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof aux32);
+                db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+
+                for (l = 0; l < 4; ++l)
+                    iq_grid4x2(nita_iq3xxs_grid, q[2 * l + 0], q[2 * l + 1],
+                               nita_ksigns64[(aux32 >> 7 * l) & 127], w8 + 8 * l);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32];
+
+                    vacc[i] = _mm256_fmadd_ps(iq_dot32(ab->qs, w8),
+                                              _mm256_set1_ps(db * ab->d), vacc[i]);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_iq3_xxs(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_iq3_s(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib32, i0;
+
+#if defined(__AVX2__)
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        __m256    vacc[8];
+
+        for (i = 0; i < tc; ++i) vacc[i] = _mm256_setzero_ps();
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk  = row + (size_t)sb * 110;
+            float          d    = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t *qs   = blk + 2;
+            const uint8_t *qh   = blk + 66;
+            const uint8_t *signs = blk + 74;
+            const uint8_t *sc   = blk + 106;
+
+            for (ib32 = 0; ib32 < 8; ib32 += 2) {
+                const float    db1  = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] & 0x0F));
+                const float    db2  = d * (1.0f + 2.0f * (float)(sc[ib32 / 2] >> 4));
+                const uint8_t *q1   = qs + 8 * ib32;
+                const uint8_t *sn1  = signs + 4 * ib32;
+                int8_t         w8[32];
+                int            l;
+
+                for (l = 0; l < 4; ++l)
+                    iq_grid4x2(nita_iq3s_grid,
+                               (int)(q1[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 0x100)),
+                               (int)(q1[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 0x100)),
+                               nita_signmask64[sn1[l]], w8 + 8 * l);
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab1 = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32];
+
+                    vacc[i] = _mm256_fmadd_ps(iq_dot32(ab1->qs, w8),
+                                              _mm256_set1_ps(db1 * ab1->d), vacc[i]);
+                }
+                {
+                    const uint8_t *q2  = q1 + 8;
+                    const uint8_t *sn2 = sn1 + 4;
+
+                    for (l = 0; l < 4; ++l)
+                        iq_grid4x2(nita_iq3s_grid,
+                                   (int)(q2[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 0x100)),
+                                   (int)(q2[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 0x100)),
+                                   nita_signmask64[sn2[l]], w8 + 8 * l);
+
+                    for (i = 0; i < tc; ++i) {
+                        const nita_aq8_t *ab2 = &a[(size_t)(i0 + i) * stride + sb * 8 + ib32 + 1];
+
+                        vacc[i] = _mm256_fmadd_ps(iq_dot32(ab2->qs, w8),
+                                                  _mm256_set1_ps(db2 * ab2->d), vacc[i]);
+                    }
+                }
+                qh += 2;
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = hsum256_ps(vacc[i]);
+    }
+    return;
+#endif
+    for (i = 0; i < t; ++i)
+        out[(size_t)i * out_stride] = dot_iq3_s(row, &a[(size_t)i * stride], nb);
+}
+
+static void dot_tile_iq1_s(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib, i0;
+
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 50;
+            float          d   = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t  *qs = blk + 2;
+            const uint16_t *qh = (const uint16_t *)(blk + 34);
+
+            for (ib = 0; ib < 8; ++ib) {
+                const uint16_t qhv  = qh[ib];
+                const float    dl   = d * (2.0f * (float)((qhv >> 12) & 7) + 1.0f);
+                const float    delta = (qhv & 0x8000u) ? -0.125f : 0.125f;
+                int8_t         w8[32];
+                int            l;
+
+                for (l = 0; l < 4; ++l) {
+                    const uint64_t *g = nita_iq1s_grid + (qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8));
+                    memcpy(w8 + 8 * l, g, 8);
+                }
+
+                for (i = 0; i < tc; ++i) {
+                    const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib];
+#if defined(__AVX2__)
+                    const float hs = hsum256_ps(iq_dot32(ab->qs, w8));
+#else
+                    const float hs = (float)iq_dot32_scalar(ab->qs, w8);
+#endif
+                    tot[i] += ab->d * dl * (hs + delta * (float)ab->sum);
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+}
+
+static void dot_tile_iq1_m(const uint8_t *row, const nita_aq8_t *a, int stride,
+                           int t, int nb, float *out, int out_stride)
+{
+    int i, sb, ib, i0;
+
+    for (i0 = 0; i0 < t; i0 += 8) {
+        const int tc = (t - i0) < 8 ? (t - i0) : 8;
+        float     tot[8];
+
+        for (i = 0; i < tc; ++i) tot[i] = 0.0f;
+
+        for (sb = 0; sb < nb / 8; ++sb) {
+            const uint8_t *blk = row + (size_t)sb * 56;
+            uint16_t       sc[4];
+            uint16_t       su;
+            float          d;
+
+            memcpy(sc, blk + 48, sizeof sc);
+            su = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
+                          | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+            d  = nita_f16_to_f32(su);
+            {
+                const uint8_t *qs = blk + 0;
+                const uint8_t *qh = blk + 32;
+
+                for (ib = 0; ib < 8; ++ib) {
+                    const uint16_t s   = sc[ib / 2];
+                    const float    dl1 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 0)) & 7) + 1.0f);
+                    const float    dl2 = d * (2.0f * (float)((s >> (6 * (ib % 2) + 3)) & 7) + 1.0f);
+                    const uint8_t  q_0 = qs[4 * ib + 0], q_1 = qs[4 * ib + 1];
+                    const uint8_t  q_2 = qs[4 * ib + 2], q_3 = qs[4 * ib + 3];
+                    const uint8_t  h_0 = qh[2 * ib + 0], h_1 = qh[2 * ib + 1];
+                    const int      idx0 = q_0 | ((h_0 << 8) & 0x700);
+                    const int      idx1 = q_1 | ((h_0 << 4) & 0x700);
+                    const int      idx2 = q_2 | ((h_1 << 8) & 0x700);
+                    const int      idx3 = q_3 | ((h_1 << 4) & 0x700);
+                    const float    d0 = (h_0 & 0x08) ? -0.125f : 0.125f;
+                    const float    d1 = (h_0 & 0x80) ? -0.125f : 0.125f;
+                    const float    d2 = (h_1 & 0x08) ? -0.125f : 0.125f;
+                    const float    d3 = (h_1 & 0x80) ? -0.125f : 0.125f;
+                    int8_t         w8[32];
+                    uint64_t       g;
+
+                    memcpy(&g, nita_iq1s_grid + idx0, 8); memcpy(w8 +  0, (const uint8_t *)&g, 8);
+                    memcpy(&g, nita_iq1s_grid + idx1, 8); memcpy(w8 +  8, (const uint8_t *)&g, 8);
+                    memcpy(&g, nita_iq1s_grid + idx2, 8); memcpy(w8 + 16, (const uint8_t *)&g, 8);
+                    memcpy(&g, nita_iq1s_grid + idx3, 8); memcpy(w8 + 24, (const uint8_t *)&g, 8);
+
+                    for (i = 0; i < tc; ++i) {
+                        const nita_aq8_t *ab = &a[(size_t)(i0 + i) * stride + sb * 8 + ib];
+#if defined(__AVX2__)
+                        const int lo = iq_dot16(ab->qs, w8);
+                        const int hi = iq_dot16(ab->qs + 16, w8 + 16);
+#else
+                        int32_t s0 = 0, s1 = 0, s2_ = 0, s3 = 0, j;
+
+                        for (j = 0; j < 8; ++j) s0 += (int32_t)ab->qs[j] * w8[j];
+                        for (j = 0; j < 8; ++j) s1 += (int32_t)ab->qs[8 + j] * w8[8 + j];
+                        for (j = 0; j < 8; ++j) s2_ += (int32_t)ab->qs[16 + j] * w8[16 + j];
+                        for (j = 0; j < 8; ++j) s3 += (int32_t)ab->qs[24 + j] * w8[24 + j];
+                        const int lo = s0 + s1, hi = s2_ + s3;
+#endif
+                        tot[i] += ab->d * (dl1 * ((float)lo + d0 * (float)ab->sums[0]
+                                                          + d1 * (float)ab->sums[1])
+                                        + dl2 * ((float)hi + d2 * (float)ab->sums[2]
+                                                          + d3 * (float)ab->sums[3]));
+                    }
+                }
+            }
+        }
+        for (i = 0; i < tc; ++i)
+            out[(size_t)(i0 + i) * out_stride] = tot[i];
+    }
+}
+
 void nita_quant_dot_tile(uint32_t type, const uint8_t *row,
                          const nita_aq8_t *a, int stride, int t, int nb,
                          float *out, int out_stride)
 {
-    if (type == 6)  { dot_tile_q5_0(row, a, stride, t, nb, out, out_stride); return; }
-    if (type == 7)  { dot_tile_q5_1(row, a, stride, t, nb, out, out_stride); return; }
-    if (type == 8)  { dot_tile_q8_0(row, a, stride, t, nb, out, out_stride); return; }
-    if (type == 12) { dot_tile_q4_K(row, a, stride, t, nb, out, out_stride); return; }
-    if (type == 14) { dot_tile_q6_K(row, a, stride, t, nb, out, out_stride); return; }
-    if (type == 20) { dot_tile_iq4_nl(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 2)   { dot_tile_q4_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 3)   { dot_tile_q4_1(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 6)   { dot_tile_q5_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 7)   { dot_tile_q5_1(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 8)   { dot_tile_q8_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 9)   { dot_tile_q8_1(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 10)  { dot_tile_q2_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 11)  { dot_tile_q3_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 12)  { dot_tile_q4_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 13)  { dot_tile_q5_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 14)  { dot_tile_q6_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 15)  { dot_tile_q8_K(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 16)  { dot_tile_iq2_xxs(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 17)  { dot_tile_iq2_xs(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 18)  { dot_tile_iq3_xxs(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 19)  { dot_tile_iq1_s(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 20)  { dot_tile_iq4_nl(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 21)  { dot_tile_iq3_s(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 22)  { dot_tile_iq2_s(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 23)  { dot_tile_iq4_xs(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 29)  { dot_tile_iq1_m(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 34)  { dot_tile_tq1_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 35)  { dot_tile_tq2_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 39)  { dot_tile_mxfp4(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 41)  { dot_tile_q1_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 42)  { dot_tile_q2_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 142) { dot_tile_pq2_0(row, a, stride, t, nb, out, out_stride); return; }
+    if (type == 143) { dot_tile_ptq1_0(row, a, stride, t, nb, out, out_stride); return; }
 
-    /* Types without a fused tile form still stay in the integer domain, they
-     * just expand the weights once per token instead of once per tile. */
+    /* A type without a kernel keeps the old behaviour: integer domain,
+     * expanded once per token instead of once per tile. */
     {
         int i;
 
